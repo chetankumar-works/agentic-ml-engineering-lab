@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv
+uv.lock.tmp
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Datasets (fetched, not committed — see README for fetch instructions)
+data/raw/
+data/higgs/
+*.csv.gz
+HIGGS.csv*
+
+# Docker / infra local state
+volumes/
+.docker/
+pgdata/
+minio-data/
+kafka-data/
+redis-data/
+
+# Airflow local state
+airflow/logs/
+airflow/airflow.db
+airflow/airflow.cfg
+airflow/webserver_config.py
+
+# MLflow local state
+mlruns/
+mlartifacts/
+
+# Node (minimal web app, later milestones)
+node_modules/
+dist/
+build/
+
+# Kubernetes secrets rendered locally
+*.kubeconfig
+secrets.local.yaml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

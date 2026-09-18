@@ -1,0 +1,53 @@
+[project]
+name = "amel"
+version = "0.1.0"
+description = "Agentic ML Engineering Lab — an executable, learning-oriented production ML platform"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["services", "apps", "sdk", "ml", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+check_untyped_defs = true
+no_implicit_optional = true
+disallow_untyped_defs = false  # tightened per-package as real services land
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.uv]
+# Virtual project: no installable top-level package yet. services/apps/sdk
+# get their own pyproject.toml (or are added here) as first-party packages
+# land in later milestones.
+package = false
