@@ -19,31 +19,40 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 0 (repository skeleton, tooling, GitHub remote) — see
-`PROJECT_STATE.md` for current detail. No runtime services exist yet;
-`make up`/`down`/`logs`/`migrate`/`seed`/`smoke` are placeholders until
-Milestone 1.
+Milestone 1 (PostgreSQL + Kafka + source simulator + stream ingestor) —
+see `PROJECT_STATE.md` for current detail and exact acceptance numbers.
 
-## Quickstart (current state — tooling only)
+## Quickstart
 
-Requires [`uv`](https://docs.astral.sh/uv/) (installs without root):
+Requires [`uv`](https://docs.astral.sh/uv/) (installs without root) and
+Docker with Compose v2:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Then, from the repo root:
+From the repo root:
 
 ```bash
-make install     # uv sync — creates .venv pinned to Python 3.12 (see DECISIONS.md ADR-0001)
-make lint         # ruff check
-make fmt          # ruff format
-make typecheck    # mypy
-make test         # pytest
+make install      # uv sync --all-packages — creates .venv pinned to Python 3.12 (see DECISIONS.md ADR-0001)
+make lint          # ruff check
+make fmt           # ruff format
+make typecheck     # mypy
+make test          # pytest — unit tests only, no infra required
+
+make up            # docker compose up: Postgres, Kafka, migrations, source_simulator, stream_ingestor
+make logs          # follow all service logs
+make smoke         # Milestone 1 acceptance check against a running `make up` stack
+make down          # stop everything
 ```
 
 `.python-version` pins this project to Python 3.12 regardless of the
 system's default `python3`. `uv` reads it automatically.
+
+The source simulator downloads the ~2.8GB UCI HIGGS dataset zip on first
+start (see `services/source_simulator/src/source_simulator/dataset.py`)
+and caches it under `./data/raw/` (bind-mounted, gitignored) — this takes
+a while on a slow connection but only happens once.
 
 ## Repository layout
 

@@ -51,18 +51,43 @@ Each layer is built only after the one below it demonstrably works — see
 `PROJECT_STATE.md`'s milestone list for the authoritative sequencing and
 current status.
 
-## Data flow, current (Milestone 0)
+## Data flow, current (Milestone 1)
 
-No runtime data flow yet. This project has tooling and documentation
-only. First data flow (source simulator → Kafka → consumer → Postgres)
-lands in Milestone 1.
+```
+UCI HIGGS zip (downloaded once, streamed row-by-row, never fully
+materialized) → source_simulator
+    → higgs.features.v1 (immediate)     → stream_ingestor consumer group
+    → higgs.labels.v1 (delayed by LABEL_DELAY_SECONDS)  ↗
+         (deliberate duplicates + malformed payloads injected per
+          DUPLICATE_RATE / INVALID_EVENT_RATE)
+
+stream_ingestor: batch → validate (shared Pydantic schema) →
+    valid    → landing.higgs_feature_events / landing.higgs_label_events
+               (INSERT ... ON CONFLICT (event_id) DO NOTHING, one
+               transaction per batch, Kafka offsets committed only after
+               that transaction commits)
+    invalid  → higgs.features.dlq / higgs.labels.dlq (envelope with
+               reason + raw bytes; offset committed immediately — see
+               LEARNING_LOG.md)
+```
+
+Implemented in `libs/amel_common` (shared schemas/logging),
+`libs/amel_db` (models + Alembic migrations), `services/source_simulator`,
+`services/stream_ingestor`. Full reasoning, the crash/redelivery
+argument, and what was actually verified: `LEARNING_LOG.md`'s Milestone 1
+entry and `RUNBOOKS.md`.
 
 ## Reliability properties established so far
 
-None yet at the systems level — Milestone 0 is tooling/environment only.
-`DECISIONS.md` ADR-0001 documents the one reliability-adjacent decision
-made so far: pinning the Python interpreter so dependency installs are
-reproducible across sessions and machines.
+- **At-least-once delivery + idempotent sink** (Milestone 1): a crash
+  between the DB write and the Kafka offset commit causes a harmless
+  redelivery, never silent data loss and never a duplicate row. Verified
+  with a real `SIGKILL` mid-processing — see `RUNBOOKS.md`.
+- **Dead-letter handling as a deliberate path**, not an afterthought: a
+  schema-invalid message is routed and its offset committed immediately,
+  so it can never poison-pill a partition by blocking redelivery forever.
+- Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
+  installs are reproducible across sessions and machines.
 
 ## Cross-cutting concerns **(planned, referenced here so later docs can link back)**
 

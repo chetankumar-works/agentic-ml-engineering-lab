@@ -1,9 +1,9 @@
 .PHONY: install lint fmt typecheck test up down logs migrate seed smoke
 
-# --- Working targets ---
+COMPOSE = docker compose -f infra/docker-compose.yml
 
 install:
-	uv sync
+	uv sync --all-packages
 
 lint:
 	uv run ruff check .
@@ -17,24 +17,22 @@ typecheck:
 test:
 	uv run pytest
 
-# --- Infra-dependent targets (land starting Milestone 1) ---
-# These intentionally exit 0 so `make` never errors on a target that
-# doesn't have infra behind it yet — see PROJECT_STATE.md for status.
+# --- Infra-dependent targets (Milestone 1: Postgres + Kafka + source_simulator + stream_ingestor) ---
 
 up:
-	@echo "not yet implemented: docker compose stack arrives in Milestone 1"
+	$(COMPOSE) up -d --build
 
 down:
-	@echo "not yet implemented: docker compose stack arrives in Milestone 1"
+	$(COMPOSE) down
 
 logs:
-	@echo "not yet implemented: docker compose stack arrives in Milestone 1"
+	$(COMPOSE) logs -f
 
 migrate:
-	@echo "not yet implemented: Alembic migrations arrive in Milestone 1"
+	$(COMPOSE) run --rm migrate
 
 seed:
-	@echo "not yet implemented: seed data arrives in Milestone 1"
+	@echo "no separate seed step: landing data arrives continuously from source_simulator once 'make up' is running"
 
 smoke:
-	@echo "not yet implemented: smoke tests arrive in Milestone 1"
+	uv run python scripts/smoke_milestone1.py

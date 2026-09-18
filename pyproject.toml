@@ -13,10 +13,13 @@ dev = [
     "pytest>=8.3",
 ]
 
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["services", "apps", "sdk", "ml", "tests"]
+src = ["services", "apps", "sdk", "ml", "libs", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -43,7 +46,7 @@ no_implicit_optional = true
 disallow_untyped_defs = false  # tightened per-package as real services land
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "libs", "services"]
 addopts = "-ra"
 
 [tool.uv]

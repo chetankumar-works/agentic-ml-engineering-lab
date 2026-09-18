@@ -103,3 +103,40 @@ already flagged as likely for Airflow), split that service into its own
 shared lockfile — document that split here when it happens, and note
 whether the CI/CD workflow needed to change to build/test it
 independently.
+
+---
+
+## ADR-0003: Kafka in KRaft mode, no ZooKeeper
+
+**Problem.** `AMEL_KICKOFF_PROMPT.md` asks for "modern Kafka
+configuration." Kafka historically required a separate ZooKeeper
+ensemble for cluster metadata/controller election; KRaft (Kafka's own
+Raft-based metadata quorum, GA since Kafka 3.3+) removes that dependency.
+
+**Decision.** Run Kafka in KRaft mode, combined `broker,controller`
+roles, single node, using the official `apache/kafka:3.9.0` image — no
+ZooKeeper container.
+
+**Reason.** ZooKeeper-based Kafka is legacy as of 2026: Kafka 4.x removed
+ZooKeeper support entirely, and even on 3.x it's explicitly the
+deprecated path. Running it here would teach a pattern that's actively
+being retired industry-wide, which cuts against this project's stated
+learning goal. KRaft also means one fewer stateful service to run,
+migrate, and reason about in Compose/Kubernetes later, with no loss of
+any concept this project needs to demonstrate (consumer groups,
+partitions, offsets, replication factor are all identical from a
+client's perspective).
+
+**Tradeoffs.** Single-node KRaft (one combined broker+controller) is a
+dev/learning topology, not a production one — a real deployment would
+run an odd number (3+) of controller nodes for quorum safety. This
+project's local Compose/kind/minikube targets never need that, so it's
+not implemented, but it's worth knowing this is the gap between "runs
+locally" and "runs in production" for this specific piece.
+
+**Future reconsideration trigger.** If Milestone 8+ (Kubernetes) needs to
+demonstrate multi-broker behavior (e.g. partition reassignment,
+replication-factor-2+ failover) that a single-node topology can't show,
+add a multi-node KRaft cluster at that point — the topic/consumer code
+in `services/stream_ingestor` and `services/source_simulator` doesn't
+change either way.
