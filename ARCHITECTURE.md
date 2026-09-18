@@ -6,6 +6,105 @@ sections describing unbuilt components are marked **(planned)**. Update a
 section's status to built and link the relevant code/docs as each
 milestone lands — don't let this drift into aspirational fiction.
 
+## Start here (no prior ML/platform-engineering experience required)
+
+**What AMEL actually does, in one paragraph.** A stream of physics
+detector readings (the HIGGS dataset, replayed as if it were live) flows
+continuously into the system. AMEL's job is to take that raw, messy,
+continuously-arriving stream and turn it into: (1) a clean historical
+record nothing loses or duplicates, (2) a trustworthy, validated dataset
+other systems can build on, (3) a trained model that predicts something
+useful from it, (4) an API that serves live predictions from that model,
+and (5) enough visibility into all of the above that a human — or later,
+a constrained AI agent — can tell what's happening and fix it when it
+breaks. Every numbered layer below is one of those five things, built in
+order, each one proven working before the next is added.
+
+**Why build it this way instead of just training a model on a CSV?**
+Because "train a model" is the easy 5% of real ML engineering. The other
+95% — the part this project is actually about — is everything a model
+needs *around* it to be useful and trustworthy in production: data has to
+arrive reliably even when things crash mid-stream, be validated before
+anyone trusts it, be reproducible enough that "what changed?" has an
+answer, be servable with predictable latency, and be observable enough
+that "why did this break?" has an answer too. AMEL builds each of those
+properties as a real, working, verified system — not a slide describing
+one.
+
+**The system end to end, as it will look once every layer lands:**
+
+```mermaid
+flowchart LR
+    subgraph Source["1. Data enters the system"]
+        SIM[source_simulator<br/>replays HIGGS as live events]
+    end
+    subgraph Stream["Kafka — a durable delivery pipe"]
+        K1[higgs.features.v1]
+        K2[higgs.labels.v1]
+    end
+    subgraph Ingest["2. Safe landing"]
+        ING[stream_ingestor<br/>dedupe + persist]
+        PG1[(Postgres<br/>landing schema)]
+    end
+    subgraph Batch["3. Batch curation"]
+        AF[Airflow DAG<br/>bronze/silver/gold]
+        MINIO[(MinIO object storage)]
+        PG2[(Postgres<br/>curated schema)]
+    end
+    subgraph Features["4. Feature store (planned)"]
+        FEAST[Feast]
+        REDIS[(Redis<br/>online features)]
+    end
+    subgraph Model["5. Model lifecycle (planned)"]
+        TRAIN[training job]
+        MLF[(MLflow<br/>tracking + registry)]
+    end
+    subgraph Serve["6. Serving (planned)"]
+        API[inference_api]
+    end
+    subgraph See["7. Observability (planned)"]
+        OTEL[OpenTelemetry]
+        GRAF[Grafana]
+    end
+
+    SIM --> K1 & K2 --> ING --> PG1
+    PG1 --> AF --> MINIO
+    AF --> PG2
+    PG2 --> FEAST --> REDIS
+    MINIO --> TRAIN --> MLF --> API
+    REDIS --> API
+    ING -.emits traces/logs.-> OTEL
+    AF -.emits traces/logs.-> OTEL
+    API -.emits traces/logs.-> OTEL
+    OTEL --> GRAF
+```
+
+Boxes 1–3 are built and verified today (Milestones 1–2). Boxes 4–7 are
+planned — see the milestone-by-milestone build order below and
+`PROJECT_STATE.md` for exactly what's real right now versus what's
+still ahead.
+
+**A short glossary, since the rest of this document uses these terms
+constantly without re-explaining them:**
+
+| Term | Plain-language meaning |
+|---|---|
+| **Idempotent** | Doing the same operation twice has the same effect as doing it once. The whole system leans on this constantly: if a message gets delivered twice (which distributed systems do, routinely), an idempotent write just quietly no-ops the second time instead of creating a duplicate. |
+| **At-least-once delivery** | A messaging guarantee that a message will arrive one *or more* times, never zero times. Kafka gives you this by default. Combined with idempotent writes, "one or more times" becomes as safe as "exactly once" in practice. |
+| **Watermark** | A saved "I've processed everything up to here" bookmark. Each pipeline run reads the watermark, processes everything newer than it, then moves the watermark forward — so a rerun never reprocesses old data from scratch. |
+| **DAG** | "Directed Acyclic Graph" — Airflow's term for a pipeline: a set of steps with dependencies between them (step B can't start until step A finishes), and no step depends on itself, directly or in a loop. |
+| **Bronze / silver / gold** | A common data-lake naming convention for "how refined is this data": bronze = raw copy exactly as it arrived, silver = cleaned and typed, gold = ready for a specific consumer (here, model training). |
+| **Feature store** | A system that serves the same engineered features to both model training (historical, point-in-time-correct) and live inference (latest values, low latency) — so the model never sees different logic in the two places, a common and hard-to-debug source of production ML bugs. |
+| **Point-in-time correctness** | When building a training example for "what happened at time T," only using data that was actually known *before* T — not accidentally leaking a future value into a historical training row. |
+| **Idempotent sink** | The specific technique used here: an `event_id` as a database primary key plus `INSERT ... ON CONFLICT DO NOTHING`, so redelivering the same event a second time is a safe no-op instead of a duplicate row. |
+| **Consumer group / offset** | Kafka concepts: a *consumer group* is one or more processes cooperatively reading a topic; an *offset* is "how far into the topic has this group read." Committing an offset means "don't send me this message again." |
+| **Schema-valid but still wrong** | A message can pass structural validation (right fields, right types) while still being *semantically* wrong (a sensor value 1000x too large, a duplicate ID within a batch). AMEL validates for both, at different layers — see the "validate" pipeline stage. |
+
+If a term shows up elsewhere in this document that isn't in that table,
+`LEARNING_LOG.md` explains it in more depth in whichever milestone's
+entry introduced it — that file is written explicitly to teach, not just
+to record.
+
 ## Why this shape
 
 AMEL simulates a realistic ML platform's operational surface: events

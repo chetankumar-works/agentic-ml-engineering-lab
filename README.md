@@ -74,9 +74,10 @@ tests/         cross-cutting/integration/e2e tests
 
 | File | Purpose |
 |---|---|
-| `ARCHITECTURE.md` | System design and how components fit together |
+| `ARCHITECTURE.md` | System design, start-to-finish diagram, and a glossary — **start here if you're new** |
 | `PROJECT_STATE.md` | Current milestone, what works, what's next — read this first when resuming |
 | `LEARNING_LOG.md` | What was built and why, per subsystem, with concepts and interview questions |
+| `MISTAKES.md` | Every real bug hit during this build, root cause and fix, in under a minute per entry |
 | `DECISIONS.md` | Architecture Decision Records |
 | `SECURITY.md` | Secret handling, auth model, reporting |
 | `RUNBOOKS.md` | Operational runbooks for failure scenarios |
