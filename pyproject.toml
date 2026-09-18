@@ -11,6 +11,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pytest>=8.3",
+    "pandas-stubs>=2.2",
 ]
 
 [tool.uv.workspace]
@@ -45,8 +46,24 @@ check_untyped_defs = true
 no_implicit_optional = true
 disallow_untyped_defs = false  # tightened per-package as real services land
 
+# boto3/botocore ship no type stubs and boto3-stubs is a heavy,
+# generated-per-service dependency not worth pulling in for the couple
+# of S3 calls amel_lake makes — see object_store.py's own `Any` client type.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
+ignore_missing_imports = true
+
+# Airflow itself is deliberately NOT a workspace dependency (see
+# DECISIONS.md ADR-0002/ARCHITECTURE.md — it lives in its own image with
+# its own strict pins). infra/airflow/dags/higgs_pipeline.py imports it;
+# treating it as untyped rather than installing it into the shared dev
+# venv keeps that isolation while still type-checking the rest of the file.
+[[tool.mypy.overrides]]
+module = ["airflow.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
-testpaths = ["tests", "libs", "services"]
+testpaths = ["tests", "libs", "services", "infra/airflow"]
 addopts = "-ra"
 
 [tool.uv]

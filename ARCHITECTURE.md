@@ -51,7 +51,7 @@ Each layer is built only after the one below it demonstrably works — see
 `PROJECT_STATE.md`'s milestone list for the authoritative sequencing and
 current status.
 
-## Data flow, current (Milestone 1)
+## Data flow, current (Milestone 2)
 
 ```
 UCI HIGGS zip (downloaded once, streamed row-by-row, never fully
@@ -69,13 +69,32 @@ stream_ingestor: batch → validate (shared Pydantic schema) →
     invalid  → higgs.features.dlq / higgs.labels.dlq (envelope with
                reason + raw bytes; offset committed immediately — see
                LEARNING_LOG.md)
+
+higgs_pipeline (Airflow DAG, higgs_pipeline_tasks.py has the logic):
+  determine_high_watermark  (control.pipeline_watermarks: higgs_features / higgs_labels)
+    → extract_new_records   (landing.* WHERE ingested_at in (watermark, upper_bound])
+    → write_bronze          (MinIO bronze/higgs/{features,labels}/dt=.../run_id=....parquet — raw shape)
+    → validate               (Pandera; invalid rows quarantined, report → MinIO pipeline/artifacts/...)
+    → transform               (flatten nested `features` JSON → 28 typed float columns)
+    → write_silver            (MinIO silver/... — analytics-ready shape)
+    → update_curated_tables   (upsert curated.higgs_features/higgs_labels
+                                + advance both watermarks — ONE transaction)
+    → build_training_dataset  (join ACCUMULATED curated.higgs_features/higgs_labels
+                                for entities missing from curated.training_records —
+                                not this run's delta, so late-arriving labels are
+                                still picked up; upsert + MinIO gold/training/....parquet)
+    → update_feature_store    (stub — Feast lands in Milestone 3)
+    → emit_pipeline_metadata  (one control.pipeline_runs row per run;
+                                on_failure_callback covers the failure path too)
 ```
 
-Implemented in `libs/amel_common` (shared schemas/logging),
-`libs/amel_db` (models + Alembic migrations), `services/source_simulator`,
-`services/stream_ingestor`. Full reasoning, the crash/redelivery
-argument, and what was actually verified: `LEARNING_LOG.md`'s Milestone 1
-entry and `RUNBOOKS.md`.
+Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
+(models + Alembic migrations), `libs/amel_lake` (MinIO client, object
+keys, Pandera validation, watermark read/advance),
+`services/source_simulator`, `services/stream_ingestor`,
+`infra/airflow/dags/`. Full reasoning, the three bugs found during the
+acceptance run, and what was actually verified: `LEARNING_LOG.md`'s
+Milestone 1 and Milestone 2 entries and `RUNBOOKS.md`.
 
 ## Reliability properties established so far
 
@@ -86,6 +105,16 @@ entry and `RUNBOOKS.md`.
 - **Dead-letter handling as a deliberate path**, not an afterthought: a
   schema-invalid message is routed and its offset committed immediately,
   so it can never poison-pill a partition by blocking redelivery forever.
+- **Watermark-gated, idempotent batch curation** (Milestone 2): the
+  watermark only advances in the same transaction as the curated upsert
+  it gates, and the upsert itself is `ON CONFLICT DO NOTHING` — so even
+  when the watermark's own monotonicity briefly broke under concurrent
+  retries (a real bug, see LEARNING_LOG.md), the *data* stayed correct;
+  only the (safely deduplicated) re-extraction window widened.
+- **Data-quality gate as a first-class pipeline stage**: `validate`
+  quarantines bad rows and fails the run above a configurable invalid
+  threshold, rather than either silently dropping bad data or letting it
+  flow downstream unchecked.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 

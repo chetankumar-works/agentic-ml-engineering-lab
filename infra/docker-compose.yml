@@ -11,6 +11,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U amel -d amel"]
       interval: 5s
@@ -64,6 +65,74 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
 
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: amel
+      MINIO_ROOT_PASSWORD: amel_dev_password
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/init/create_buckets.sh"]
+    volumes:
+      - ./minio/create_buckets.sh:/init/create_buckets.sh:ro
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: amel
+      MINIO_ROOT_PASSWORD: amel_dev_password
+
+  airflow:
+    build:
+      context: ..
+      dockerfile: infra/airflow/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://amel:amel_dev_password@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      # AMEL's own database (not Airflow's metadata DB) — read by DAG tasks via amel_db.
+      DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: amel
+      AWS_SECRET_ACCESS_KEY: amel_dev_password
+      AWS_REGION: us-east-1
+      PIPELINE_STAGING_DIR: /opt/airflow/staging
+      HIGGS_PIPELINE_SCHEDULE: ${HIGGS_PIPELINE_SCHEDULE:-*/5 * * * *}
+      VALIDATION_MAX_INVALID_FRACTION: ${VALIDATION_MAX_INVALID_FRACTION:-0.05}
+      LOG_LEVEL: info
+    command: standalone
+    volumes:
+      - airflow-staging:/opt/airflow/staging
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/v2/monitor/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
   source-simulator:
     build:
       context: ..
@@ -115,3 +184,5 @@ services:
 volumes:
   postgres-data:
   kafka-data:
+  minio-data:
+  airflow-staging:

@@ -140,3 +140,73 @@ replication-factor-2+ failover) that a single-node topology can't show,
 add a multi-node KRaft cluster at that point — the topic/consumer code
 in `services/stream_ingestor` and `services/source_simulator` doesn't
 change either way.
+
+---
+
+## ADR-0004: Airflow gets its own image, own Postgres database, and `airflow standalone`
+
+**Problem.** Milestone 2 needed Airflow orchestrating the bronze/silver/
+gold batch pipeline. Three separate decisions: (1) how does Airflow's own
+Python environment relate to the uv workspace the rest of the project
+uses; (2) where does Airflow's metadata database live; (3) which of
+Airflow's several deployment topologies (standalone, or separate
+webserver/scheduler/triggerer/dag-processor containers, with
+LocalExecutor/CeleryExecutor/KubernetesExecutor) fits a single-developer
+local learning setup.
+
+**Decision.**
+1. Airflow is installed in its own Docker image (`infra/airflow/
+   Dockerfile`, based on `apache/airflow:3.3.2-python3.12`), *not* added
+   to the uv workspace. `libs/amel_common`/`libs/amel_db`/`libs/amel_lake`
+   are `pip install`ed into that image directly from their source
+   directories (each is still a normal, self-contained package with its
+   own `pyproject.toml`).
+2. Airflow's metadata database is a second database (`airflow`) on the
+   *same* Postgres container AMEL already runs — not a separate Postgres
+   instance, not SQLite.
+3. Airflow runs as a single container via `airflow standalone`
+   (`AIRFLOW__CORE__EXECUTOR=LocalExecutor`), bundling the API
+   server/webserver, scheduler, triggerer, and DAG processor in one
+   process group.
+
+**Reason.**
+1. This is exactly the trigger ADR-0002 anticipated: Airflow ships an
+   extremely strict, version-pinned dependency set (via its own
+   "constraints files"), and forcing it into the same `uv.lock` as
+   `confluent-kafka`/`fastapi`/etc. would be fighting the tool rather
+   than using it. Empirically, `apache/airflow:3.3.2-python3.12` already
+   bundles compatible-or-newer versions of nearly everything AMEL's own
+   packages need (pydantic 2.13, SQLAlchemy 2.0, psycopg 3.3, boto3,
+   pandas, pyarrow, structlog) via its `amazon`/`postgres` providers —
+   only `alembic` and `pandera` needed adding. Isolating Airflow's
+   environment cost almost nothing here and avoids a much worse problem
+   later (a real lockfile conflict blocking `uv sync` for the whole repo).
+2. A second Postgres *container* would be pure infrastructure overhead
+   (another volume, another healthcheck, another thing that can fail)
+   for zero benefit at this scale — a second *database* on the existing
+   instance gets the real isolation that matters (Airflow's ~50 internal
+   tables never mixing with AMEL's own schemas) without it.
+3. `airflow standalone` is explicitly Airflow's own recommended path for
+   local development and trying things out — it self-initializes the
+   metadata DB and a default admin user on first boot, which matches
+   this project's "one `make up` and everything works" goal better than
+   hand-wiring four separate long-running containers plus a Redis broker
+   for CeleryExecutor would.
+
+**Tradeoffs.** `airflow standalone` prints a warning that SimpleAuthManager
+(the default auth backend here) stores passwords in plaintext and isn't
+meant for production — correct, and fine: this never runs anywhere but a
+developer's own machine. LocalExecutor also means all task parallelism is
+bounded by one container's CPU/memory, and — more substantively — every
+DAG task in `infra/airflow/dags/higgs_pipeline.py` hands data to the next
+task via local disk (`/opt/airflow/staging/<run_id>/`, a Docker volume)
+rather than object storage, which only works because LocalExecutor keeps
+every task on the same machine. A distributed executor (Celery/
+Kubernetes) would need that hand-off rewritten to go through MinIO or
+similar between every task, not just for the bronze/silver landing itself.
+
+**Future reconsideration trigger.** If Milestone 10 (KEDA/autoscaling) or
+a later milestone needs to demonstrate genuinely distributed task
+execution, revisit both the executor (LocalExecutor → CeleryExecutor or
+KubernetesExecutor) and the local-staging hand-off pattern in the DAG
+tasks together — they're coupled, per the tradeoff above.

@@ -93,3 +93,70 @@ Exercised continuously during Milestone 1 development
   testing this path. In a real upstream-schema-drift incident, the next
   step would be a `schema.validation_failed` platform event (Milestone
   11+) and an on-call alert on DLQ volume — not yet built.
+
+## higgs_pipeline: bulk upsert exceeds Postgres's parameter limit
+
+Hit during the Milestone 2 acceptance run at ~48k rows extracted in one
+window.
+
+- **Symptom**: `update_curated_tables_task` fails with
+  `psycopg.OperationalError: sending query and params failed: number of
+  parameters must be between 0 and 65535`.
+- **Likely cause**: a single multi-row `INSERT ... VALUES (...), (...)`
+  built from one row per Airflow task execution — parameter count scales
+  as `rows × columns`, and Postgres hard-caps the total per query
+  regardless of how much memory/time you're willing to spend.
+- **Diagnosis steps**: check `extracted_features`/`extracted_labels` on
+  the failing run's `control.pipeline_runs` row (once the *next* run
+  succeeds and reports it) or the task log's `Task failed with
+  exception` line — the parameter count in the error message divided by
+  the table's column count gives the approximate row count that broke it.
+- **Recovery**: none needed once fixed — `higgs_pipeline_tasks.py`
+  chunks every bulk upsert at `UPSERT_BATCH_SIZE = 2000` rows
+  (`_chunked()`), keeping every single INSERT's parameter count an order
+  of magnitude under the limit regardless of backlog size. A stuck task
+  instance just needs a normal retry/rerun after the fix ships.
+- **Data-loss implications**: none — the failed transaction rolled back
+  entirely (nothing partially committed), and the watermark never
+  advanced past that window, so the retry safely reprocessed it in full.
+- **Prevention/follow-up**: `UPSERT_BATCH_SIZE` is a constant, not
+  computed from table width — if a much wider table starts using this
+  same upsert pattern, recompute the safe batch size for it explicitly
+  rather than assuming 2000 is universally safe.
+
+## higgs_pipeline: watermark regressed under concurrent DAG run retries
+
+Observed during the Milestone 2 acceptance run when several runs that
+had failed on the bugs above were all retried together after a container
+rebuild, briefly overlapping in execution.
+
+- **Symptom**: `control.pipeline_watermarks.watermark` moved *backward*
+  — observed sitting at an earlier run's `upper_bound` (`20:10:00`) even
+  though later runs (`upper_bound` `20:13:19`, `20:15:00`) had already
+  completed successfully and should have advanced it further.
+- **Likely cause**: `advance_watermark`'s original `ON CONFLICT DO
+  UPDATE SET watermark = <new value>` overwrites unconditionally —
+  whichever transaction *commits last* wins, which is not necessarily
+  the run with the logically latest `upper_bound` when runs execute
+  concurrently or out of order.
+- **Diagnosis steps**: compare `control.pipeline_watermarks.watermark`
+  against `MAX(features_watermark_after)` /
+  `MAX(labels_watermark_after)` across `control.pipeline_runs` for
+  successful runs — if the stored watermark is behind the max, this bug
+  (or a variant of it) is present.
+- **Recovery**: fixed by making the upsert monotonic — `SET watermark =
+  GREATEST(current, new)` (`amel_lake/watermark.py`). No manual recovery
+  was needed even before the fix landed: the next run simply
+  re-extracted a wider (but safely deduplicated) window. Verified
+  directly: triggering a run after the fix advanced the watermark from
+  the regressed `20:10:00` to `20:25:00`, and the resulting wide
+  re-extraction/re-upsert produced zero duplicate rows in any curated
+  table.
+- **Data-loss implications**: none — this class of bug can only cause
+  wasted reprocessing (wider re-extraction windows), never data loss,
+  *because* the upserts it gates are already idempotent. That
+  idempotency is precisely what made this bug low-severity instead of a
+  correctness incident.
+- **Prevention/follow-up**: none further needed — the same `GREATEST`
+  pattern should be used for any future checkpoint/watermark value that
+  can be written by more than one execution context.

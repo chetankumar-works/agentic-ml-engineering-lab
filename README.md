@@ -19,8 +19,9 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 1 (PostgreSQL + Kafka + source simulator + stream ingestor) —
-see `PROJECT_STATE.md` for current detail and exact acceptance numbers.
+Milestone 2 (Airflow + MinIO bronze/silver/gold batch pipeline, on top
+of Milestone 1's PostgreSQL + Kafka streaming ingestion) — see
+`PROJECT_STATE.md` for current detail and exact acceptance numbers.
 
 ## Quickstart
 

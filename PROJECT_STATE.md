@@ -7,131 +7,115 @@ clean stopping point mid-milestone) per the Definition of Done in
 
 ## Current milestone
 
-**Milestone 1 — PostgreSQL, Kafka, source simulator, stream ingestor.** Complete.
+**Milestone 2 — Airflow + MinIO + bronze/silver/gold batch pipeline.** Complete.
 
 ## Completed work
 
-- **uv workspace** (`[tool.uv.workspace]` in root `pyproject.toml`,
-  members `libs/*` and `services/*`): `libs/amel_common` (versioned
-  Pydantic event schemas, structured JSON logging), `libs/amel_db`
-  (SQLAlchemy models + Alembic migrations), `services/source_simulator`,
-  `services/stream_ingestor`. `make install` now runs `uv sync
-  --all-packages` to pull in the whole workspace (plain `uv sync` only
-  syncs what the root project depends on, which is nothing — the root is
-  a virtual/non-package project).
-- **PostgreSQL**: schemas `control`, `landing`, `curated`, `ml`, `audit`,
-  `finops` provisioned; `landing.higgs_feature_events` and
-  `landing.higgs_label_events` tables built, with `event_id` as primary
-  key (the idempotency mechanism) plus indexes on `entity_id` and the
-  timestamp columns. Alembic migration `0001_schemas_and_landing_tables`.
-- **Kafka**: KRaft mode (no ZooKeeper), `apache/kafka:3.9.0`, dual
-  listeners (`kafka:9092` in-network, `localhost:29092` from the host).
-  All 7 topics from the spec created by a one-shot `kafka-init` container
-  running `infra/kafka/create_topics.sh` (idempotent — `--if-not-exists`).
-- **`services/source_simulator`**: downloads/streams the UCI HIGGS
-  dataset (zip never fully extracted or loaded into memory), publishes
-  `FeatureEvent`s immediately and `LabelEvent`s after a configurable
-  delay (heap-based `DelayedDispatcher`), with configurable rate, burst
-  mode, deliberate duplicate generation, and deliberate malformed-payload
-  generation (four corruption strategies, see `malformed.py`). `/health`,
-  `/ready`, `/status`, `/pause`, `/resume`, `/metrics` (Prometheus).
-- **`services/stream_ingestor`**: single consumer group across both
-  topics, batched consumption, schema validation against the *same*
-  Pydantic models the simulator uses, idempotent bulk upsert (`INSERT ...
-  ON CONFLICT (event_id) DO NOTHING ... RETURNING event_id` — the
-  `RETURNING` diff is how duplicates are *counted*, not just tolerated),
-  Kafka offset commit only after the DB transaction commits, DLQ routing
-  for invalid messages (offset committed immediately — see
-  LEARNING_LOG.md for why), exponential-backoff retry on transient DB
-  failure, and a deliberate process-stop (not a silent skip) if retries
-  are exhausted, relying on redelivery-after-restart for recovery.
-  `/health`, `/ready`, `/metrics`.
-- **Docker Compose** (`infra/docker-compose.yml`): postgres, kafka,
-  kafka-init (one-shot), migrate (one-shot, `infra/db/Dockerfile`),
-  source-simulator, stream-ingestor — full dependency chain via
-  `depends_on` conditions (`service_healthy` / `service_completed_successfully`).
-- **`make up`/`down`/`logs`/`migrate`/`smoke`** are now real;
-  `scripts/smoke_milestone1.py` drives the acceptance check.
-- **Verified directly** (not just argued): malformed events reach the
-  DLQ with a specific validation-failure reason; duplicate-delivery
-  events are skipped (`count(*) == count(DISTINCT event_id)` holds); a
-  `docker kill -s SIGKILL` on `stream_ingestor` mid-processing, followed
-  by a restart, recovers with zero duplicate rows (see the two entries in
-  `RUNBOOKS.md`). Full acceptance-scale run (100,000+ events against the
-  real HIGGS dataset): **see the Milestone 1 acceptance run section
-  below**.
-- 21 → 25 unit tests added across the four new packages (dataset
-  streaming/cycling against a synthetic fixture, malformed-payload
-  corruption logic, delayed-dispatcher ordering, schema validation,
-  ingestor `_validate()` logic, DB model/schema sanity) — no live infra
-  required for `make test`.
+- **`libs/amel_lake`** (new uv workspace member): MinIO/S3 client
+  (`object_store.py`), deterministic bronze/silver/gold/validation-report
+  object keys (`keys.py`), Pandera-based validation with a
+  quarantine-invalid-rows pattern (`validation.py`), watermark read/
+  monotonic-advance (`watermark.py`).
+- **PostgreSQL**: `curated.higgs_features`, `curated.higgs_labels`,
+  `curated.training_records`, `control.pipeline_watermarks`,
+  `control.pipeline_runs` (Alembic `0002_curated_and_control_pipeline_tables`,
+  which also indexes `landing.*.ingested_at` for the watermark queries).
+- **MinIO**: `bronze`/`silver`/`gold`/`pipeline`/`mlflow` buckets,
+  provisioned by a one-shot `minio-init` container
+  (`infra/minio/create_buckets.sh`, idempotent).
+- **Airflow 3.3.2** (`infra/airflow/Dockerfile`, its own image outside
+  the uv workspace — see `DECISIONS.md` ADR-0004), running
+  `airflow standalone` with `LocalExecutor`, its metadata DB as a second
+  database (`airflow`) on the same Postgres instance. DAG `higgs_pipeline`
+  (`infra/airflow/dags/`): `determine_high_watermark → extract_new_records
+  → write_bronze → validate → transform → write_silver →
+  update_curated_tables → build_training_dataset → update_feature_store
+  (stub — Feast is Milestone 3) → emit_pipeline_metadata`, with retries,
+  a 10-minute per-task timeout, and a DAG-level `on_failure_callback`
+  that writes a `control.pipeline_runs` failure row.
+- Business logic (`higgs_pipeline_tasks.py`) is Airflow-independent and
+  unit-tested in the ordinary uv workspace venv; `higgs_pipeline.py` is
+  the thin Airflow wrapper (`@task`, XCom, context, retries).
+- **Idempotency**: bronze/silver/gold objects keyed by `run_id`
+  (re-running overwrites, never duplicates); curated upserts are
+  `ON CONFLICT DO NOTHING`; the watermark only advances in the same
+  transaction as the curated upsert it gates, and only ever *forward*
+  (`GREATEST`, see the bug below).
+- **Three real bugs found and fixed during the acceptance run** (full
+  writeup in `LEARNING_LOG.md`'s Milestone 2 entry, runbook entries in
+  `RUNBOOKS.md`):
+  1. `KeyError: 'data_interval_end'` on manually-triggered DAG runs (no
+     data interval exists for those) — fixed with an `_upper_bound()`
+     fallback to `dag_run.run_after`.
+  2. `psycopg.OperationalError: ... between 0 and 65535` — a bulk upsert
+     of one row per extracted record blew Postgres's bind-parameter cap
+     at real backlog scale — fixed by chunking every upsert at 2,000 rows.
+  3. The watermark could silently *regress* under concurrent/out-of-order
+     DAG run retries (unconditional overwrite) — fixed with
+     `SET watermark = GREATEST(current, new)`; verified the fix advances
+     correctly and that the resulting wide re-extraction window produced
+     zero duplicate curated rows (idempotency absorbed the metadata bug
+     cleanly).
+- 44 → 45 unit tests (up from Milestone 1's 24): dataset/validation/
+  watermark/key-building logic in `amel_lake`, DAG task logic in
+  `higgs_pipeline_tasks.py` — none require live infra.
 
-## Milestone 1 acceptance run
+## Milestone 2 acceptance run
 
-Run 2026-09-18 against the real UCI HIGGS dataset (downloaded to
-`data/raw/higgs.zip`, gitignored) via `make up` + `make smoke`
-(`HIGGS_MAX_ROWS=500000 EVENTS_PER_SECOND=2000`):
+Run 2026-09-18 against the live, continuously-growing landing tables
+(source_simulator + stream_ingestor running throughout) via `make up`
+plus manually triggering `higgs_pipeline` (`airflow dags trigger
+higgs_pipeline`) both as ad-hoc runs and via its `*/5 * * * *` schedule.
+
+**10 DAG runs, all `status='success'`** in `control.pipeline_runs` by
+the end of the session (including runs that initially hit the three bugs
+above and succeeded on retry after each fix shipped, and one run that
+legitimately processed a zero-row window with no errors).
+
+Final state when the stack was brought down for this commit:
 
 ```
-waiting for >= 100,000 feature events (timeout 600s)...
-  ... (progress logged every 5s) ...
-  feature events persisted so far: 104,357 / 100,000
-checking for duplicate event_ids...
-  OK: 104,357 rows, 104,357 distinct event_ids — no duplicates persisted
-checking malformed events reached the DLQ topics...
-  higgs.features.dlq: 253 message(s) observed
-  higgs.labels.dlq: 297 message(s) observed
-
-Milestone 1 smoke test PASSED.
+curated.higgs_features:   884,910 rows, 884,910 distinct event_id
+curated.higgs_labels:     880,628 rows, 880,628 distinct event_id
+curated.training_records: 878,903 rows, 878,903 distinct entity_id
+control.pipeline_watermarks: higgs_features / higgs_labels both at
+  2026-09-18 20:28:16.599563, advancing monotonically across every run
+control.pipeline_runs: 10/10 status='success'
+MinIO: bronze/silver objects for every run (higgs/{features,labels}/
+  dt=.../run_id=....parquet), gold/training/run_id=....parquet for runs
+  that added new training records, pipeline/artifacts/validation_reports/
+  run_id=....json for every run
 ```
 
-Immediately after, `stream-ingestor` was `docker kill -s SIGKILL`'d again
-(second time this milestone, this time against the real-scale run) and
-restarted: `count(*)` and `count(DISTINCT event_id)` on
-`landing.higgs_feature_events` matched exactly both before and after
-(159,668 / 159,668). Final counts when the stack was brought down for
-this commit: 161,649 feature events and 145,619 label events persisted,
-all with distinct `event_id`s; simulator counters at that point: 226,209
-features published (4,386 as deliberate duplicates, ~900 as deliberate
-malformed) against 224,009 rows read from the real dataset.
-
-**All four Milestone 1 acceptance criteria verified against the real
-dataset**: 100,000+ events streamed and persisted; duplicates create no
-duplicate records; malformed events reach the DLQ; consumer restart is
-safe.
+**All Milestone 2 acceptance criteria verified against real, live data**:
+the scheduled DAG processes newly-arrived `landing` data idempotently
+into `curated` via MinIO bronze/silver/gold Parquet — including under
+adverse conditions (concurrent retries, a stale/regressed watermark
+forcing a wide re-extraction) that came up organically during the run,
+not from a contrived test.
 
 ## Verified tool versions (WSL2, Ubuntu 26.04 LTS "resolute")
 
-Unchanged from Milestone 0 (re-verify at the start of Milestone 2) — see
-git history for that table, or re-run `node -v`, `python3 --version`,
-`docker --version`, `docker compose version`. One addition this
-milestone: `apache/kafka:3.9.0` and `postgres:16-alpine` Docker images.
+Unchanged from Milestone 0/1 (re-verify at the start of Milestone 3) —
+see git history for the full table. Additions this milestone:
+`apache/airflow:3.3.2-python3.12`, `quay.io/minio/minio:latest`,
+`quay.io/minio/mc:latest` (MinIO moved off Docker Hub to Quay —
+`minio/minio`/`minio/mc` no longer resolve there).
 
 ## Current known failures / gaps
 
-- The real HIGGS dataset zip (~2.8GB) is fetched from
-  `archive.ics.uci.edu`, which is slow and unreliable for this
-  environment's network path: one attempt stalled at a fixed byte count
-  for over an hour, another had its connection reset mid-transfer at
-  ~1.3GB, and the server flatly rejects HTTP Range/resume requests
-  (`curl: (33) HTTP server does not seem to support byte ranges`) — so a
-  failed attempt cannot resume, only restart from zero. What finally
-  worked: a single `curl --retry-all-errors --retry 15` invocation (no
-  `-C -`) with a stall guard (`--speed-time`/`--speed-limit`).
-  `source_simulator.ensure_dataset()` itself (via `requests`) has none of
-  this retry hardening yet — it does one `requests.get(..., stream=True)`
-  and gives up on any exception. Worth hardening if this dataset is
-  fetched somewhere less patient than an interactive session (add retry/
-  backoff, or document a faster mirror). Also **discovered and fixed**
-  along the way: the real archive's zip contains `HIGGS.csv.gz` (gzip
-  *inside* the zip), not a plain `HIGGS.csv` as originally assumed —
-  `dataset.py`'s `_find_csv_member`/`stream_rows` now handle both, with a
-  regression test for the gzip-inside-zip case
-  (`test_stream_rows_reads_gzip_compressed_csv_member`).
-- No deliberate Postgres-down or Kafka-down chaos exercise yet (only
-  consumer-kill was exercised, twice — once at small scale, once at
-  acceptance scale) — good candidates for the Milestone 7+ Failure
-  Engineering pass, not required by this milestone's acceptance criteria.
+- `build_training_dataset` joins the *full* `curated.higgs_features`/
+  `curated.higgs_labels` against `curated.training_records` (LEFT JOIN
+  WHERE NULL) every single run — correct, but the scan grows with
+  curated table size (observed ~50s at ~550k curated rows). Documented
+  as a known limitation in the task's own docstring; revisit with
+  incremental materialization if/when this becomes the pipeline's
+  bottleneck, not before.
+- `source_simulator.ensure_dataset()` still has no download retry/
+  hardening (carried over from Milestone 1's known gaps) — not touched
+  this milestone.
+- No deliberate MinIO-down or Airflow-scheduler-down chaos exercise yet
+  — good candidate for the Milestone 7+ Failure Engineering pass.
 - No CI workflow yet (Milestone 7).
 
 ## Commands that work today
@@ -140,43 +124,52 @@ milestone: `apache/kafka:3.9.0` and `postgres:16-alpine` Docker images.
 make install       # uv sync --all-packages
 make lint / fmt / typecheck / test   # all pass, no infra required
 
-make up             # postgres, kafka, kafka-init, migrate, source-simulator, stream-ingestor
+make up             # postgres, kafka, minio, airflow, kafka-init, minio-init,
+                     # migrate, source-simulator, stream-ingestor
 make logs
-make smoke          # scripts/smoke_milestone1.py against a running `make up` stack
+make smoke          # Milestone 1 check (100k+ events, dedup, DLQ)
 make down
+
+# Airflow (Milestone 2):
+docker exec amel-airflow-1 airflow dags trigger higgs_pipeline
+docker exec amel-airflow-1 airflow tasks states-for-dag-run higgs_pipeline <run_id>
+docker exec amel-airflow-1 airflow dags list-import-errors
+# UI: http://localhost:8080 (SimpleAuthManager; admin password printed to
+# the airflow container's logs on first boot)
 
 # manual verification used during this milestone:
 docker exec amel-postgres-1 psql -U amel -d amel -c \
-  "SELECT count(*), count(DISTINCT event_id) FROM landing.higgs_feature_events;"
-docker exec amel-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server localhost:9092 --describe --group stream-ingestor
+  "SELECT count(*), count(DISTINCT event_id) FROM curated.higgs_features;"
+docker exec amel-postgres-1 psql -U amel -d amel -c \
+  "SELECT * FROM control.pipeline_watermarks;"
+docker run --rm --network amel_default --entrypoint sh quay.io/minio/mc:latest -c \
+  "mc alias set local http://minio:9000 amel amel_dev_password && mc ls -r local/bronze"
 ```
 
 ## Next task
 
-**Milestone 2 — Airflow + MinIO + bronze/silver/gold processing.**
+**Milestone 3 — Feast + Redis.**
 
-Acceptance: a scheduled DAG processes newly arrived `landing` data
-idempotently into `curated` via MinIO bronze/silver/gold Parquet.
+Acceptance: historical features can be retrieved and online
+materialization demonstrated.
 
-Concretely, in order (see `AMEL_KICKOFF_PROMPT.md`'s Airflow/MinIO/Data
-Validation sections for full detail):
-1. Add MinIO to `infra/docker-compose.yml`; buckets/prefixes
-   `bronze/higgs`, `silver/higgs`, `gold/training`.
-2. Add Airflow (scheduler + webserver, or a lightweight standalone
-   variant — decide and record in `DECISIONS.md`) to Compose.
-3. DAG: `determine_high_watermark → extract_new_records → write_bronze →
-   validate → transform → write_silver → update_curated_tables →
-   build_training_dataset → update_feature_store (stub until Milestone
-   3) → emit_pipeline_metadata`. Idempotent re-runs, retries, retry
-   delay, timeouts, XCom for small metadata only, failure callbacks.
-4. Data validation layer (Pandera or equivalent) producing observable
-   validation reports for schema/type/null/target/bounds/duplicate-id/
-   timestamp checks.
-5. `curated.higgs_features`, `curated.higgs_labels`,
-   `curated.training_records` tables (new Alembic migration in
-   `libs/amel_db`).
-6. Document watermark/checkpoint storage choice and idempotent-DAG-rerun
-   reasoning in `LEARNING_LOG.md`.
-7. Full Definition of Done pass, commit `feat(milestone-2): ...`, push,
-   tag `milestone-2`.
+Concretely, in order (see `AMEL_KICKOFF_PROMPT.md`'s Feature Store
+section for full detail):
+1. Add Redis to `infra/docker-compose.yml` as the online store.
+2. Build `ml/feature_repo` — Feast entity/feature-view definitions over
+   `curated.higgs_features`/`curated.higgs_labels` (Postgres) or the
+   `silver`/`gold` Parquet in MinIO as the offline source (decide which
+   and record the reasoning in `DECISIONS.md` — Feast's Postgres offline
+   store vs. a file/Parquet offline store have different tradeoffs worth
+   being explicit about).
+3. Demonstrate historical (point-in-time-correct) feature retrieval for
+   training, and online feature materialization + retrieval for
+   inference, as two clearly separate, working code paths.
+4. Replace `update_feature_store`'s no-op stub in `higgs_pipeline.py`
+   with a real Feast materialization call, now that there's a feature
+   store to materialize into.
+5. Document what a feature store solves (point-in-time correctness,
+   train/serve skew prevention, online/offline consistency) and what it
+   does *not* solve, in `LEARNING_LOG.md`.
+6. Full Definition of Done pass, commit `feat(milestone-3): ...`, push,
+   tag `milestone-3`.

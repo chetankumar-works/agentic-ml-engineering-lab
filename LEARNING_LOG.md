@@ -277,3 +277,216 @@ the eventual restart safe.
   real workload, and what's the tradeoff?" (larger/longer batches: fewer
   offset commits and better DB throughput, but a bigger
   guaranteed-redelivery window on crash.)
+
+---
+
+## Milestone 2 — Airflow + MinIO + bronze/silver/gold batch pipeline
+
+**WHAT WAS BUILT.** A single Airflow 3.3.2 container (`LocalExecutor`,
+`airflow standalone`) running `higgs_pipeline`, a 10-task DAG:
+`determine_high_watermark → extract_new_records → write_bronze →
+validate → transform → write_silver → update_curated_tables →
+build_training_dataset → update_feature_store (stub) →
+emit_pipeline_metadata`. MinIO provides the `bronze`/`silver`/`gold`/
+`pipeline`/`mlflow` buckets. New Postgres tables:
+`curated.higgs_features`, `curated.higgs_labels`,
+`curated.training_records`, `control.pipeline_watermarks`,
+`control.pipeline_runs`. Business logic lives in
+`infra/airflow/dags/higgs_pipeline_tasks.py` (no `airflow.*` imports —
+unit-tested in the ordinary uv workspace venv); `higgs_pipeline.py` is
+the thin Airflow wrapper. A new `libs/amel_lake` workspace package holds
+the MinIO client, deterministic object-key builders, and a Pandera-based
+validation layer.
+
+**WHY IT EXISTS.** `landing` is an operational write path (Milestone 1's
+job: get Kafka data into Postgres safely). Nothing downstream should
+query it directly forever — it has no data-quality gate, no typed/flat
+feature columns, no durable object-storage copy, and no
+point-in-time-correct training view. This milestone builds the layer
+that turns "safely landed" into "trustworthy and queryable at scale":
+bronze (raw durable copy), silver (validated, typed, analytics-ready),
+curated (deduplicated Postgres tables other services can query directly,
+Milestone 3's Feast feature store included), gold (training-ready
+joined dataset).
+
+**HOW DATA/CONTROL FLOWS THROUGH IT.**
+1. `determine_high_watermark` reads `control.pipeline_watermarks` for
+   two independently-tracked streams (`higgs_features`, `higgs_labels`)
+   and computes `upper_bound` — `data_interval_end` for a scheduled run,
+   or `dag_run.run_after` for a manual trigger (which has no data
+   interval at all — this was the first bug found; see below).
+2. `extract_new_records` queries `landing.*` for
+   `ingested_at > watermark AND <= upper_bound`, writing raw results to
+   local staging (`/opt/airflow/staging/<run_id>/`, a Docker volume) —
+   inter-task hand-off, not the durable copy.
+3. `write_bronze` uploads that same data to MinIO, keyed by `run_id`
+   (idempotent — retrying a run overwrites the same object).
+4. `validate` runs it through Pandera schemas (28 HIGGS features
+   bounds-checked, duplicate-`event_id` detection, timestamp sanity,
+   target ∈ {0,1}), quarantines invalid rows, writes a JSON report to
+   MinIO, and fails the task if `invalid_fraction` exceeds a threshold.
+5. `transform` flattens the nested `features` JSON into 28 typed float
+   columns — bronze keeps the raw nested shape; silver is analytics-ready.
+6. `write_silver` uploads the transformed data to MinIO.
+7. `update_curated_tables` upserts into `curated.higgs_features`/
+   `higgs_labels` (`ON CONFLICT DO NOTHING`, same pattern as Milestone
+   1's sink) and advances both watermarks — **in one transaction**, so a
+   failure here never leaves the watermark ahead of what's durably
+   curated.
+8. `build_training_dataset` joins the *accumulated* curated tables (not
+   this run's delta) for entities missing from
+   `curated.training_records`, upserts the new rows, and writes a gold
+   Parquet snapshot of just the newly-completed joins.
+9. `update_feature_store` is a deliberate no-op — Feast lands in
+   Milestone 3.
+10. `emit_pipeline_metadata` writes one `control.pipeline_runs` row
+    summarizing the whole run (every count, every object key). A DAG-level
+    `on_failure_callback` writes a `status='failed'` row from whichever
+    task actually raised, so a failed run is never silently invisible.
+
+**Why the join in step 8 is against curated state, not the run's
+delta.** `LABEL_DELAY_SECONDS` means a feature event can be ingested
+before its label. If `build_training_dataset` only looked at *this run's*
+newly-extracted features/labels, a feature whose label arrives in a
+*later* run would never get joined — its feature row was already past
+the watermark by the time the label showed up. Joining against the full,
+ever-growing `curated.higgs_features`/`higgs_labels` (filtered to
+entities not yet in `training_records`) means a late label is picked up
+correctly the first run after it lands, regardless of when its feature
+was curated. This is the load-bearing reason `update_curated_tables`
+(accumulate) and `build_training_dataset` (join-against-accumulated) are
+separate steps rather than one.
+
+**THREE REAL BUGS FOUND AND FIXED DURING THE ACCEPTANCE RUN** (not
+hypothetical — each was caught by actually running the DAG against a
+live, growing dataset, which is exactly why "run it for real" is part of
+this project's Definition of Done, not just "unit tests pass"):
+
+1. **`KeyError: 'data_interval_end'` on manual triggers.** A
+   schedule-driven run always has a `data_interval_end`; a manually
+   triggered run (`airflow dags trigger`, no explicit logical date) has
+   *no data interval at all* — the key is simply absent from the task
+   context, not `None`. Fixed with a `_upper_bound(context)` helper that
+   falls back to `dag_run.run_after`. Lesson: test the code path a human
+   operator will actually use (`airflow dags trigger` for an ad-hoc
+   run/backfill), not only the path the scheduler exercises.
+2. **`psycopg.OperationalError: number of parameters must be between 0
+   and 65535`.** Postgres hard-caps bind parameters per query. A single
+   `INSERT ... VALUES (...), (...), ...` built from one row per Airflow
+   task execution scales with backlog size — at ~48k extracted rows × 6
+   columns that's already ~288k parameters, blowing the limit by 4x.
+   Fixed by chunking every bulk upsert (`UPSERT_BATCH_SIZE = 2000`) in
+   `higgs_pipeline_tasks.py`. Lesson: a bulk upsert that works fine in a
+   small dev test can hit a hard platform limit the moment a real backlog
+   exists — this is exactly why the acceptance run used the real,
+   continuously-growing dataset rather than a fixed small fixture.
+3. **Watermark could silently regress under concurrent retries.** Several
+   DAG runs ended up `up_for_retry` simultaneously (an artifact of
+   iterating on bug #1/#2 live against a running scheduler) and were all
+   retried together once the image was rebuilt. `advance_watermark`'s
+   original `ON CONFLICT DO UPDATE SET watermark = <new value>`
+   unconditionally overwrites — whichever transaction *committed last*
+   wins, regardless of which had the logically later `upper_bound`.
+   Observed directly: the watermark ended up at `20:10:00` even though
+   runs with `upper_bound` `20:13:19` and `20:15:00` had already
+   succeeded, because a still-in-flight `20:10:00` run committed after
+   them. Not data-lossy (a regressed watermark only causes redundant,
+   safely-deduplicated re-extraction), but incorrect "high watermark"
+   semantics. Fixed with `SET watermark = GREATEST(current, new)` in the
+   upsert (`amel_lake/watermark.py`), verified by (a) a unit test that
+   inspects the compiled SQL for `GREATEST`, and (b) triggering a fresh
+   run after the fix and confirming the watermark advanced from the
+   regressed `20:10:00` to `20:25:00` — and that the resulting wide
+   re-extraction window (re-processing already-curated data) produced
+   **zero duplicate rows** in any curated table, which is itself a live
+   demonstration that the idempotent-upsert design tolerates exactly this
+   kind of watermark misbehavior gracefully. A related, lower-stakes
+   version of the same class of bug: the ORM model's
+   `onupdate=func.now()` on `updated_at` never fires through a raw Core
+   `INSERT ... ON CONFLICT DO UPDATE` (only through the ORM unit-of-work)
+   — fixed by setting `updated_at` explicitly in the same `SET` clause.
+
+**IMPORTANT CODE FILES.**
+- `infra/airflow/dags/higgs_pipeline_tasks.py` — all business logic;
+  read `update_curated_tables_and_advance_watermarks` and
+  `build_training_dataset` together to see the atomicity/join argument
+  above.
+- `infra/airflow/dags/higgs_pipeline.py` — Airflow wrapper: `_upper_bound`
+  (bug #1), the `on_failure_callback`, task wiring.
+- `libs/amel_lake/src/amel_lake/watermark.py` — the `GREATEST`-based
+  monotonic advance (bug #3).
+- `libs/amel_lake/src/amel_lake/validation.py` — Pandera schemas and the
+  quarantine-invalid-rows pattern.
+- `DECISIONS.md` ADR-0004 — why Airflow gets its own image/database/
+  `standalone` deployment instead of joining the uv workspace.
+
+**FAILURE MODES (exercised, not hypothetical).**
+- Manual trigger with no data interval → handled (bug #1 above).
+- Large backlog blowing the Postgres parameter limit → handled via
+  batched upserts (bug #2).
+- Concurrent/out-of-order task retries racing on shared state (watermark,
+  curated tables) → idempotent upserts made this safe by construction;
+  the watermark's own monotonicity needed an explicit fix (bug #3) even
+  though the *data* was never at risk.
+- Empty extraction window (a scheduled run landed before any data
+  existed) → `validate`/`transform`/`write_*` all handle a zero-row
+  DataFrame without error (see `test_empty_dataframe_is_trivially_valid`
+  and the real `scheduled__20:05:00` run, which processed 0 rows
+  end-to-end successfully).
+
+**HOW TO TEST IT.**
+- Unit tests (`make test`, no infra required): `WatermarkBounds`,
+  `transform_features`/`transform_labels` dtype coercion, `_chunked`,
+  the `GREATEST`/`updated_at` SQL-construction checks, Pandera validation
+  against synthetic DataFrames (valid, out-of-range, duplicate-ID,
+  out-of-domain target).
+- Integration (`make up`, then trigger the DAG): `airflow dags trigger
+  higgs_pipeline`, `airflow tasks states-for-dag-run higgs_pipeline
+  <run_id>` to watch it, then query `control.pipeline_runs` /
+  `control.pipeline_watermarks` and `count(*) = count(DISTINCT ...)` on
+  every curated table.
+- Acceptance evidence from this session: 7 DAG runs, all `success`;
+  final curated counts in the high hundreds of thousands per table, zero
+  duplicates in any of them; MinIO holds bronze/silver/gold/validation-
+  report objects for every run.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Watermark-based CDC extraction vs. fixed-window batch extraction, and
+  why this pipeline uses the former (events arrive continuously with
+  variable lag, not in neat scheduler-aligned windows).
+- Medallion architecture (bronze/silver/gold) as a concrete pattern, not
+  just a buzzword: what each layer is *for* and why silver's schema
+  differs from bronze's (nested-raw vs. flat-typed).
+- Why "join against accumulated state" is sometimes required instead of
+  "join against this batch's delta" — the general problem of late-arriving
+  related data, which recurs constantly in real data engineering
+  (SCD dimension joins, delayed fact tables, etc.).
+- Idempotency as a system property that has to be verified, not assumed:
+  the watermark regression bug shows that even a system built with
+  idempotent upserts everywhere can still have a *metadata* bug (the
+  checkpoint itself) that only shows up under concurrency.
+- Hard platform limits (Postgres's 65535 bind parameters) as a real
+  operational constraint that scales with data volume, not something
+  that shows up in a small local test.
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "Design a pipeline that turns continuously-arriving Kafka-sourced
+  Postgres data into a training-ready dataset, handling the fact that
+  labels arrive after features." (watermark-based extraction + curated
+  accumulation + join-against-accumulated-state, not run-delta joins)
+- "Your batch upsert works in dev but fails in production with a
+  'too many parameters' error — what's happening and how do you fix it?"
+- "How would a checkpoint/watermark value end up wrong even though every
+  individual data write was correctly idempotent? How do you prevent
+  that?" (unconditional overwrite vs. monotonic `GREATEST` advance under
+  concurrent/out-of-order commits)
+- "Why keep bronze and silver as separate zones instead of just writing
+  directly to a clean, typed table?" (raw/reprocessable audit copy vs.
+  consumption-ready shape; reprocessing silver from bronze doesn't need
+  to re-hit the source system)
+- "What's the tradeoff of joining against a run's own extracted delta
+  versus the full accumulated curated state?" (delta: cheap, misses
+  late-arriving related data; accumulated: correct, but the query grows
+  with curated table size — this pipeline chose correctness and flagged
+  the growing-scan cost as a known, documented limitation rather than
+  solving incremental materialization here.)
