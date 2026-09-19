@@ -107,7 +107,7 @@ to record.
 
 ## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
 
-Three views, all of what is **built** as of Milestone 3 unless a node is
+Three views, all of what is **built** as of Milestone 4 unless a node is
 marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
 
 ### System context
@@ -123,6 +123,7 @@ flowchart LR
         ing["stream_ingestor"]
         af["Airflow: higgs_pipeline"]
         fs["Feast feature server"]
+        ml["MLflow tracking + registry"]
         inf["inference_api<br/>(planned, M5)"]
         plat["platform_api / agents<br/>(planned, M11+)"]
     end
@@ -131,7 +132,7 @@ flowchart LR
     amel -->|"metrics, traces, logs"| obs["Prometheus / Grafana / Tempo / Loki<br/>(planned, M6)"]
 ```
 
-### End-to-end data flow (built through Milestone 3)
+### End-to-end data flow (built through Milestone 4)
 
 ```mermaid
 flowchart TB
@@ -162,10 +163,20 @@ flowchart TB
         server -.-> registry
     end
 
+    subgraph training ["Milestone 4 — training + registry"]
+        curated -->|"labels <= as_of<br/>entity df"| train["amel-train train<br/>split · fit · evaluate"]
+        offline -->|"get_historical_features<br/>point-in-time join"| train
+        train -->|"params, metrics, artifacts,<br/>dataset fingerprint, git SHA"| mlflow["MLflow server"]
+        mlflow --> mlflowdb[("Postgres db 'mlflow'")]
+        mlflow -->|"artifacts, model"| minio
+        train -->|"register -> alias candidate"| registry_m["Registry: higgs_decision_tree<br/>@candidate / @champion"]
+        promote["amel-train promote<br/>criteria + audit"] -->|"alias champion"| registry_m
+        promote -->|"ml.model_promotions"| curated
+    end
+
     subgraph consumers ["Consumers"]
-        offline -->|"get_historical_features<br/>point-in-time join"| train["Training<br/>(planned, M4)"]
         redis -->|"get_online_features<br/>latest values"| infer["inference_api<br/>(planned, M5)"]
-        curated -->|"entity df from labels"| train
+        registry_m -->|"models:/...@champion"| infer
     end
 ```
 
@@ -198,13 +209,18 @@ flowchart LR
         m3d["chunked materialization<br/>+ real update_feature_store"]
         m3e["honest liveness/readiness<br/>in simulator + ingestor<br/>failure-engineering script"]
     end
-    subgraph next ["M4+ (planned)"]
-        m4["Training + MLflow"]
+    subgraph M4 ["M4 — training + MLflow"]
+        m4a["ml/training<br/>amel-train train/promote/show"]
+        m4b["MLflow server<br/>Postgres db + MinIO artifacts"]
+        m4c["Alembic 0004<br/>ml.model_promotions audit"]
+        m4d["as_of-pinned datasets<br/>content fingerprint"]
+    end
+    subgraph next ["M5+ (planned)"]
         m5["inference_api / platform_api"]
         m6["OpenTelemetry stack"]
         m8["Kubernetes"]
     end
-    M0 --> M1 --> M2 --> M3 --> next
+    M0 --> M1 --> M2 --> M3 --> M4 --> next
 ```
 
 
@@ -253,7 +269,7 @@ Each layer is built only after the one below it demonstrably works — see
 `PROJECT_STATE.md`'s milestone list for the authoritative sequencing and
 current status.
 
-## Data flow, current (Milestone 3)
+## Data flow, current (Milestone 4)
 
 ```
 UCI HIGGS zip (downloaded once, streamed row-by-row, never fully
@@ -299,6 +315,13 @@ Feast (ml/feature_repo, DECISIONS.md ADR-0005):
   backfill      make feast-materialize (scripts/materialize.py, chunked, resumable)
   steady state  the DAG task above, every 5 minutes
   serving       feast-server: POST /get-online-features, POST /materialize
+
+Training + registry (ml/training, DECISIONS.md ADR-0006):
+  amel-train train    labels <= as_of → Feast offline join → seeded split → DecisionTree
+                      → MLflow run (params/metrics/artifacts/signature/dataset fingerprint/git SHA)
+                      → registered higgs_decision_tree vN, alias @candidate
+  amel-train promote  criteria (config) → alias @champion + ml.model_promotions audit row
+  mlflow server       Postgres db `mlflow` (metadata), MinIO bucket `mlflow` (artifacts, proxied)
 ```
 
 Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
@@ -343,6 +366,11 @@ during each acceptance run, and what was actually verified:
   liveness, current delivery/commit errors fail readiness — after both
   services were found "healthy" while functionally dead for an hour.
   `make failure-simulator-wedge` reproduces the incident as a test.
+- **Reproducible training and auditable promotion** (Milestone 4):
+  `as_of`-pinned datasets with a content fingerprint make two runs
+  bit-identical (proven); every run logs its inputs before fitting;
+  promotion is a config-driven decision with an immutable audit row, and
+  serving only ever references the `champion` alias.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 

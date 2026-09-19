@@ -248,3 +248,54 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
 - **Lesson**: read the defaults of every store config block; the
   registry URL and the offline store use different client libraries with
   different defaults.
+
+## Milestone 4 — Training + MLflow
+
+### The MLflow server booted straight into its memory cap
+- **What happened**: `amel-mlflow-1` showed 1,023 MiB / 1 GiB seconds
+  after starting, doing nothing.
+- **Root cause**: MLflow 3's default topology — 4 gunicorn workers plus
+  a job runner and two huey consumers for a server-side jobs feature.
+- **Fix**: `--workers=2`, `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`
+  → 483 MiB.
+- **Lesson**: measure a new always-on container *before* wiring anything
+  to it. "Default" is sized for someone else's machine.
+
+### MLflow rejected every request with 403 "possible DNS rebinding attack"
+- **What happened**: the first training run failed on
+  `set_experiment`.
+- **Root cause**: MLflow 3 validates the `Host` header; the Compose
+  service name isn't in its default allow-list. The fix flag
+  (`--allowed-hosts`) then errored because it is uvicorn-only and the
+  command also passed `--gunicorn-opts`.
+- **Fix**: `--allowed-hosts=mlflow:5000,localhost:5000,127.0.0.1:5000`,
+  drop the gunicorn option.
+- **Lesson**: the kickoff rule "inspect the current docs when a
+  dependency version changed" — MLflow 3 is a different server than 2.
+
+### `log_model` refused the decision tree as an untrusted type
+- **What happened**: `UntrustedTypesFoundException:
+  ['sklearn.tree._tree.Tree']`.
+- **Root cause**: MLflow 3 serializes sklearn with skops, which audits
+  types; a tree's node storage can be crafted to crash a loader.
+- **Fix**: `skops_trusted_types=["sklearn.tree._tree.Tree"]` — one
+  type, stored in the MLmodel flavor config for loaders.
+- **Lesson**: prefer the safer serializer and declare the narrow
+  exception, rather than falling back to pickle.
+
+### Blank env vars from Compose broke config parsing
+- **What happened**: `make promote` crashed in `TrainingConfig()`:
+  `as_of: input is too short`.
+- **Root cause**: `${TRAINING_AS_OF:-}` renders as `""`, which pydantic
+  parses as a (bad) datetime, not as unset.
+- **Fix**: a `mode="before"` validator maps blank strings to `None`;
+  unit-tested.
+- **Lesson**: Compose's "unset → empty string" is not Python's "unset →
+  None"; treat every optional env var at the boundary.
+
+### The new `mlflow` database didn't exist
+- **What happened**: the init script was there; the database wasn't.
+- **Root cause**: Postgres init scripts only run on a fresh data volume.
+- **Fix**: created it by hand; runbook entry added.
+- **Lesson**: anything under `docker-entrypoint-initdb.d` is
+  first-boot-only — plan the manual step for existing volumes.

@@ -7,176 +7,132 @@ clean stopping point mid-milestone) per the Definition of Done in
 
 ## Current milestone
 
-**Milestone 3 — Feast + Redis feature store.** Complete.
+**Milestone 4 — Training package + MLflow.** Complete.
 
-## Completed work (Milestone 3; Milestones 0–2 summarized in MILESTONE_REPORT.md)
+## Completed work (Milestone 4; earlier milestones in MILESTONE_REPORT.md)
 
-- **`ml/feature_repo`** (new uv workspace member `amel-feature-repo`,
-  `[tool.uv.workspace] members` now includes `ml/*`): Feast 0.66
-  `definitions.py` (entity `entity_id`; feature view `higgs_features`
-  with the 28 HIGGS `Float32` fields, `tags={"version": "1"}`, 10-year
-  TTL — see the comment for why), `feature_store.yaml` (SQL registry in a
-  new `feast` Postgres DB, Postgres offline store with `sslmode:
-  disable`, Redis online store), `scripts/materialize.py` (chunked,
-  resumable backfill), `scripts/demo_retrieval.py` (acceptance demo),
-  tests. `DECISIONS.md` ADR-0005 records the offline-store choice.
-- **PostgreSQL**: Alembic `0003` adds VIEW `curated.higgs_features_flat`
-  (28 typed `float8` columns generated from `HIGGS_FEATURE_NAMES` over
-  the JSONB `features` column); `infra/postgres/init/02-create-feast-db.sql`
-  creates the `feast` database.
-- **Redis 7** (`redis:7-alpine`, host port 6380, `redis-data` volume) as
-  the online store.
-- **Compose services**: `feast-apply` (one-shot, default set),
-  `feast-server` (always-on `feast serve`, `mem_limit: 1g`,
-  host port 6566, healthchecked — ADR-0005 explains why always-on),
-  `feast-materialize` and `feast-demo` behind `--profile feast-demo`
-  (`make feast-materialize`, `make feast-demo`). All Feast containers
-  memory-capped after an unbounded materialize hit 12.1 GB.
-- **`update_feature_store` is real**: `higgs_pipeline_tasks.py`
-  selects this run's inserted rows by `source_run_id`, splits them into
-  ≤25,000-row windows (boundaries computed in SQL), and `POST`s each to
-  `feast-server /materialize`; zero rows → no call. Airflow reaches it
-  via `FEAST_SERVER_URL`. Feast is *not* installed in the Airflow image.
-- **Honest probes** (found necessary mid-milestone, see the incident in
-  `LEARNING_LOG.md`): `source_simulator` and `stream_ingestor` now derive
-  `/health` (liveness) and `/ready` (readiness) from real producer/
-  consumer state and expose it in `/status`; the simulator's loop
-  survives transient publish errors; the ingestor treats a rejected
-  offset commit as a redelivery, not a crash.
-  `KAFKA_MESSAGE_TIMEOUT_MS` (default 30 s) and `HIGGS_START_INDEX`
-  added to the simulator.
-- **Failure engineering**: `scripts/failure_engineering/
-  simulator_producer_wedge.py` (`make failure-simulator-wedge`) pauses
-  the broker and asserts the probe transitions and recovery.
-- 45 → **69 unit tests**, none requiring infra.
+- **`ml/training`** (`amel-training`, uv workspace member): `config.py`
+  (`TRAINING_*` env; tree params, seed, split fractions, `max_rows`,
+  `as_of`, MLflow URIs, promotion criteria), `dataset.py` (labels up to
+  `as_of` → Feast `get_historical_features`), `split.py`, `evaluate.py`,
+  `provenance.py` (content fingerprint, git SHA), `train.py`,
+  `promote.py`, `cli.py` (`amel-train train | promote | show`). 11 unit
+  tests, no infra.
+- **MLflow 3.16.1 server** (`infra/mlflow/Dockerfile`; Compose `mlflow`,
+  host port 5000): Postgres backend in a new `mlflow` DB, artifacts in
+  the MinIO `mlflow` bucket proxied by the server, uvicorn `--workers=2`,
+  jobs subsystem disabled, `--allowed-hosts`, `mem_limit: 1g`
+  (measured 483–534 MiB).
+- **`train` one-shot container** (`infra/training/Dockerfile`, profile
+  `train`, `mem_limit: 3g`): `make train`, `make promote`,
+  `make model-show`.
+- **Alembic `0004`**: `ml.model_promotions` audit table +
+  `ModelPromotion` model. `infra/postgres/init/03-create-mlflow-db.sql`
+  (created by hand on the existing volume — RUNBOOKS.md).
+- **Registry**: `higgs_decision_tree` with `candidate` / `champion`
+  aliases; versions tagged with git SHA, dataset fingerprint, feature
+  view version, test metrics, promotion context.
+- `DECISIONS.md` ADR-0006; LEARNING_LOG/RUNBOOKS/MISTAKES/ARCHITECTURE
+  updated. 69 → **80 unit tests**.
 
-## Milestone 3 acceptance run
+## Milestone 4 acceptance run
 
-Run 2026-09-19 against the live stack after a clean `make down` /
-Redis-volume wipe / `make up` (the previous session had been lost to a
-WSL2 freeze mid-materialize; nothing from it was trusted).
+Run 2026-09-19 against the live stack (Milestone 3 state, simulator and
+DAG running throughout).
 
 ```
-Backfill (make feast-materialize, after redis-cli FLUSHALL → DBSIZE 0):
-  36 windows, 167 s, peak container memory 875 MiB (docker stats)
-  Redis DBSIZE 884,910 == count(*) curated.higgs_features
-  (the unchunked `feast materialize-incremental` before it: OOM-killed at 12.1 GB RSS)
+Reproducibility (TRAINING_AS_OF=2026-09-19T21:00:00, max_rows=200000, max_depth=8, seed=42):
+  run A -> version 2: fingerprint ff72b440727cb949, test_accuracy 0.689787603526583, roc_auc 0.7585938300843371
+  run B -> version 3: fingerprint ff72b440727cb949, test_accuracy 0.689787603526583, roc_auc 0.7585938300843371
+  REPRODUCIBLE: True (all 13 metrics identical to the last decimal; 199,623 rows after
+  dropping 383 labels with no point-in-time feature match); 36.6 s / 35.3 s; peak 873 MiB
 
-Demo (make feast-demo):
-  feature view: higgs_features version=1 features=28
-  historical retrieval: 20 rows, 0 with any missing feature
-  as-of one day earlier: 20 rows, 0 with leaked (future) features
-  online retrieval: 5 entities requested, 5 returned a value
-  online == offline for lepton_pt: 5/5
-  Milestone 3 demo PASSED
+Logged per run: 13 params (incl. as_of, dataset_fingerprint, feature_view_version=1, sklearn 1.9.1),
+  tags git_sha=a70d233..., 14 metrics, 11 artifacts (confusion matrices JSON+PNG for validation and
+  test, feature_importances.csv/.png, dataset_version.json, feature_definitions.json, split_sizes.json,
+  tree_shape.json, registration.json), dataset input higgs_training_ff72b440727cb949, model with
+  signature (skops); 82 objects in MinIO bucket `mlflow`
 
-DAG end-to-end (manual__2026-09-19T20:21:09 after new ids started landing):
-  update_feature_store_task success — status=materialized windows=3
-  rows this run inserted: 51,880 (higgs-000886643 .. higgs-000938837)
-  Redis DBSIZE 936,790 == curated count 936,790
-  feast-server /get-online-features higgs-000938837:
-    lepton_pt 1.029426097869873, m_bb 0.6682522296905518  == Postgres flat view
-  entity landed after the run (higgs-000944187): online value None (correctly absent)
-  control.pipeline_runs: 31/31 success (13 at session start)
+Promotion:
+  make promote (candidate v3, no champion) -> PROMOTED, exit 0
+    reason: test_accuracy 0.6898 >= floor 0.66; test_roc_auc 0.7586 >= floor 0.7; first promotion
+    ml.model_promotions row 1: version 3, decided_by chetan, criteria {0.66, 0.70, 0.005}
+  weak candidate (TRAINING_MAX_DEPTH=2) -> version 4, test_accuracy 0.6298
+  make promote -> REJECTED, exit 2, champion stays v3, reasons:
+    test_accuracy 0.6298 < floor 0.66; test_roc_auc 0.6469 < floor 0.7;
+    test_accuracy 0.6298 regresses champion 0.6898 by more than 0.005
+  make model-show -> {'candidate': '4', 'champion': '3'}
 
-Failure engineering (make failure-simulator-wedge):
-  /ready -> 503 after 32 s: "kafka delivery failing: ... Local: Message timed out"
-  /health 200 (transient, not fatal — correct); delivery_failures 0 -> 294
-  after unpause: /ready 200 in 0 s, rows_read advancing; PASSED
-
-Steady-state memory with everything up: ~5–6 GB of 15 GB
-  (feast-server 165 MiB idle / 361 MiB after materialize calls; Redis 495 MB)
+MLflow server: 1,023 MiB / 1 GiB with defaults -> 483 MiB after --workers=2 + jobs disabled
 ```
 
-**All Milestone 3 acceptance criteria verified**: historical
-(point-in-time-correct, with a negative leakage check) retrieval and
-online materialization + retrieval both work as separate code paths on
-real curated data, the scheduled DAG materializes each run's new rows,
-and online values equal offline values.
+**Milestone 4 acceptance verified**: the decision-tree training run is
+reproducible (bit-identical metrics across two runs on a pinned
+dataset) and the model is registered under `higgs_decision_tree` with
+an explicit, criteria-checked, audited champion promotion.
 
 ## Verified tool versions (WSL2, Ubuntu 26.04 LTS "resolute")
 
-Unchanged from Milestone 0/1/2 (re-verify at the start of Milestone 4) —
+Unchanged from Milestone 0/1/2/3 (re-verify at the start of Milestone 5) —
 see git history for the full table. Additions this milestone:
-`redis:7-alpine` (7.4.11), `feast[postgres,redis]==0.66.0` (in the uv
-workspace — it resolved cleanly, unlike Airflow), `mermaid-cli`/`mermaid@11`
-used only to parse-check the ARCHITECTURE.md diagrams.
+`mlflow==3.16.1` (server image and workspace client), `scikit-learn==1.9.1`,
+`python:3.12-slim-bookworm` for the MLflow image.
 
 ## Current known failures / gaps
 
-- `build_training_dataset` full-join scan (carried from Milestone 2;
-  ~50 s at ~550k curated rows) — unchanged.
-- `source_simulator.ensure_dataset()` download hardening (carried from
-  Milestone 1) — unchanged.
-- The simulator does not persist its own position: after a restart,
-  `HIGGS_START_INDEX` must be set by hand to `max(landed)+1`
-  (RUNBOOKS.md) or it replays already-seen ids. Fine for Compose; a
-  Kubernetes deployment (Milestone 8) should externalize this.
-- Per-run materialization in the DAG is synchronous; a window
-  approaching the 10-minute task timeout would need
-  `POST /materialize?async=true` + polling (ADR-0005 trigger).
-- `curated.higgs_features_flat` is a plain VIEW — JSON extraction is
-  recomputed on every offline read. Promote to a materialized view or a
-  flat table if historical retrieval becomes slow.
-- Feast's Postgres offline store materialization is ~14 KB/row of
-  memory; the 25k-row chunk (~875 MiB peak) is tuned for this machine.
-- The stream_ingestor's health regression is covered by unit tests but
-  has no live failure-engineering script yet (the simulator's does
-  double duty: pausing Kafka also exercises the ingestor's rejoin path,
-  observed manually). Candidate for the Milestone 7+ failure pass.
-- No CI workflow yet (Milestone 7).
+- Promotion compares each candidate's *own* test split against the
+  champion's; a fixed, versioned holdout set would make comparisons
+  fairer (ADR-0006 trigger).
+- `TRAINING_MAX_ROWS=200000` default; full-scale (`0`) not yet timed.
+- The `train` container rebuilds on every `make train` (`--build`) —
+  ~2 min the first time, cached after; fine locally, wasteful in CI.
+- MLflow is a single server: inference (Milestone 5) must cache the
+  champion and tolerate MLflow being down after start-up.
+- Postgres init scripts only run on a fresh volume: new databases
+  (`mlflow` this milestone) must be created by hand on existing
+  volumes (RUNBOOKS.md).
+- Carried: simulator position manual on restart; synchronous per-run
+  materialization; `higgs_features_flat` plain VIEW; training-dataset
+  scan growth; download hardening; no CI (Milestone 7); no dedicated
+  ingestor failure script.
 
 ## Commands that work today
 
 ```bash
 make install       # uv sync --all-packages
-make lint / fmt / typecheck / test   # all pass, no infra required (69 tests)
+make lint / fmt / typecheck / test   # all pass, no infra required (80 tests)
 
-make up             # postgres, kafka, minio, redis, airflow, feast-server + one-shots
-make logs
-make smoke          # Milestone 1 check
-make feast-materialize   # Milestone 3 backfill (chunked, resumable)
-make feast-demo          # Milestone 3 acceptance demo
-make failure-simulator-wedge   # pauses Kafka ~30 s, checks probes, recovers
-make down
+make up             # postgres, kafka, minio, redis, airflow, feast-server, mlflow + one-shots
+make logs / make down
+make smoke          # Milestone 1
+make feast-materialize / make feast-demo   # Milestone 3
+make failure-simulator-wedge
 
-# Feast (Milestone 3):
-curl -s localhost:6566/health
-curl -s -X POST localhost:6566/get-online-features -H 'Content-Type: application/json' \
-  -d '{"features":["higgs_features:lepton_pt"],"entities":{"entity_id":["higgs-000000001"]}}'
-docker exec amel-redis-1 redis-cli DBSIZE      # must equal count(*) of curated.higgs_features
-docker exec amel-postgres-1 psql -U amel -d feast -c "SELECT feature_view_name FROM feature_views;"
+# Training + MLflow (Milestone 4):
+TRAINING_AS_OF=2026-09-19T21:00:00 make train    # pinned, reproducible; omit AS_OF for "now"
+TRAINING_MAX_DEPTH=2 make train                  # any TRAINING_* knob passes through
+DECIDED_BY=you make promote                      # exit 0 promoted / exit 2 rejected
+make promote PROMOTE_ARGS="--version 3"          # explicit version
+make promote PROMOTE_ARGS=--force                # recorded as forced
+make model-show
+docker exec amel-postgres-1 psql -U amel -d amel -c "SELECT * FROM ml.model_promotions ORDER BY id DESC"
+# UI: http://localhost:5000
 
-# Probes (Milestone 3 fix):
-curl -s localhost:8001/status | python3 -m json.tool   # simulator: live/ready/producer_health
-curl -s localhost:8002/status                          # ingestor
-
-# Restarting the simulator without replaying ids:
-MAXID=$(docker exec amel-postgres-1 psql -U amel -d amel -tAc "SELECT max(entity_id) FROM landing.higgs_feature_events")
-HIGGS_START_INDEX=$(( 10#${MAXID#higgs-} + 1 )) docker compose -f infra/docker-compose.yml up -d --no-deps source-simulator
-
-# Airflow (Milestone 2), unchanged:
-docker exec amel-airflow-1 airflow dags trigger higgs_pipeline
-docker exec amel-airflow-1 airflow tasks states-for-dag-run higgs_pipeline <run_id>
+# Feast / probes / Airflow: unchanged from Milestone 3 (see MILESTONE_REPORT.md)
 ```
 
 ## Next task
 
-**Milestone 4 — Training + MLflow.**
+**Milestone 5 — FastAPI inference.**
 
-Acceptance (AMEL_KICKOFF_PROMPT.md "Training" and "MLflow" sections): a
-reproducible training package (`ml/training`) using
-`DecisionTreeClassifier` that retrieves features through Feast's
-*offline* path, with configuration, seeded train/validation/test split,
-metrics, confusion matrix, feature importances, model signature, dataset
-version, Git SHA, and the feature view version (`higgs_features` v1)
-recorded; an MLflow tracking server (Postgres backend, MinIO `mlflow`
-bucket for artifacts) logging all of it; registration under
-`higgs_decision_tree` with `candidate`/`champion` aliases and explicit
-promotion criteria. No notebook required for production training.
-
-Before starting: `make up`, confirm `feast-server` healthy and Redis
-`DBSIZE` == curated count, re-verify tool versions. Memory budget: the
-MLflow server is one more always-on container (~300 MB); training on
-~900k rows × 28 floats is ~200 MB in pandas — fine, but cap the
-container.
+Acceptance: `apps/inference_api` loads the champion model
+(`models:/higgs_decision_tree@champion`) and returns predictions with
+model metadata. Endpoints per AMEL_KICKOFF_PROMPT.md: `GET /health`,
+`GET /ready`, `POST /predict/raw` (validated 28 features),
+`POST /predict/entity/{entity_id}` (features via Feast online /
+`feast-server`), `GET /model`, `GET /metrics`. Cache the model safely
+with a controlled refresh; persist prediction metadata (Postgres, `ml`
+schema); publish prediction events to Kafka; return prediction id +
+model version. Honest liveness/readiness from the start (model loaded,
+feast-server reachable). Memory: one more always-on container; the
+skops-loaded tree is small — cap at 1 GB.

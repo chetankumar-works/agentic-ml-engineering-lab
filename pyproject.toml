@@ -50,7 +50,7 @@ disallow_untyped_defs = false  # tightened per-package as real services land
 # generated-per-service dependency not worth pulling in for the couple
 # of S3 calls amel_lake makes — see object_store.py's own `Any` client type.
 [[tool.mypy.overrides]]
-module = ["boto3.*", "botocore.*"]
+module = ["boto3.*", "botocore.*", "sklearn.*"]
 ignore_missing_imports = true
 
 # Airflow itself is deliberately NOT a workspace dependency (see

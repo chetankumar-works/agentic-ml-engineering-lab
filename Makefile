@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -49,3 +49,16 @@ feast-demo:          # historical (point-in-time) + online retrieval acceptance 
 
 failure-simulator-wedge:   # pauses the Kafka broker; simulator probes must go 503 and recover
 	uv run python scripts/failure_engineering/simulator_producer_wedge.py
+
+# --- Training + MLflow (Milestone 4) ---
+
+GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null)
+
+train:               # one reproducible training run -> MLflow run + registered version aliased `candidate`
+	GIT_SHA=$(GIT_SHA) $(COMPOSE) --profile train run --rm --build train train
+
+promote:             # explicit, audited candidate -> champion (fails with exit 2 if criteria fail)
+	$(COMPOSE) --profile train run --rm train promote --decided-by "$(or $(DECIDED_BY),$(USER))" $(PROMOTE_ARGS)
+
+model-show:          # current candidate/champion from the registry
+	$(COMPOSE) --profile train run --rm train show

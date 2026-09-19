@@ -317,3 +317,49 @@ group** for an hour.
 - Prevention/follow-up: `HIGGS_START_INDEX` (config + `.env.example`);
   a future improvement is to have the simulator persist its own
   position, which Milestone 8's stateful deployment would need anyway.
+
+## A new database is missing after adding a Postgres init script
+
+- Symptom: a service fails with `database "mlflow" does not exist` (or
+  `feast`, `airflow`) even though `infra/postgres/init/0N-create-*.sql`
+  exists.
+- Likely cause: `docker-entrypoint-initdb.d` scripts run **only when the
+  data volume is first initialized**. An existing `amel_postgres-data`
+  volume never sees a script added later.
+- Recovery: create it by hand once —
+  `docker exec amel-postgres-1 psql -U amel -d amel -c "CREATE DATABASE mlflow"`
+  — or, if the volume is disposable, `make down && docker volume rm
+  amel_postgres-data && make up` (this discards every landing/curated
+  row; the pipeline will rebuild them from the simulator over time).
+- Prevention: keep adding the init script (fresh checkouts need it) and
+  note the manual step in the milestone's PROJECT_STATE entry.
+
+## MLflow server: 403 "Invalid Host header", or sitting at its memory cap
+
+- Symptom (a): every client call fails with `403 ... Invalid Host header
+  - possible DNS rebinding attack detected`.
+  Cause: MLflow 3 validates `Host`; `mlflow:5000` (in-network) and
+  `localhost:5000` (from the host) must be in `--allowed-hosts`. That
+  flag only works with the default uvicorn server — do not combine it
+  with `--gunicorn-opts` (the server exits with a usage error).
+- Symptom (b): `docker stats` shows `amel-mlflow-1` at ~1 GiB / 1 GiB
+  right after boot.
+  Cause: default 4 workers + the jobs subsystem (job runner + 2 huey
+  consumers, ~200 MB each). Fix in place: `--workers=2` and
+  `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false` (measured 483–534 MiB).
+- Diagnosis: `docker logs amel-mlflow-1 | tail`, `curl -s
+  localhost:5000/health`, `docker stats --no-stream amel-mlflow-1`.
+
+## Promotion rejected (exit 2) — what now
+
+- Symptom: `make promote` prints `REJECTED` with a `reasons` list and
+  exits 2; `make model-show` still shows the previous champion.
+- This is the system working: the candidate failed a floor
+  (`TRAINING_PROMOTION_MIN_TEST_ACCURACY` / `_MIN_TEST_ROC_AUC`) or
+  regressed the champion by more than `TRAINING_PROMOTION_MAX_REGRESSION`.
+- Options: train a better candidate; adjust the criteria via env
+  (a config change, visible in the next audit row's `criteria`); or
+  `make promote PROMOTE_ARGS=--force` — recorded in
+  `ml.model_promotions.reason` as `FORCED by operator`. Never edit the
+  alias in the MLflow UI: that bypasses the audit row.
+- Verify: `SELECT * FROM ml.model_promotions ORDER BY id DESC LIMIT 3;`

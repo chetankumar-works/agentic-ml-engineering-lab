@@ -691,3 +691,113 @@ inherited the lie.
   store instead of importing the SDK in the DAG?" (Dependency isolation,
   a real service boundary, memory containment, and it mirrors production
   topology.)
+
+## Milestone 4 — Training package + MLflow
+
+**WHAT WAS BUILT.** `ml/training` (`amel-training`): `config.py`
+(every knob that changes an outcome, `TRAINING_*` env), `dataset.py`
+(entity dataframe from `curated.higgs_labels` up to `as_of` →
+`get_historical_features` through Feast's offline path), `split.py`
+(seeded, stratified train/validation/test), `evaluate.py` (accuracy,
+precision, recall, F1, ROC-AUC, log loss; confusion matrices; feature
+importances; PNG plots), `provenance.py` (dataset fingerprint, git SHA),
+`train.py` (one MLflow run: params, tags, metrics, artifacts, dataset
+input, signature, registered model version aliased `candidate`),
+`promote.py` (pure decision + audited apply), `cli.py`
+(`amel-train train | promote | show`). An `mlflow` server container
+(Postgres backend `mlflow` DB, MinIO `mlflow` bucket, proxied
+artifacts) and a one-shot `train` container. Alembic `0004`
+`ml.model_promotions`. ADR-0006.
+
+**WHY IT EXISTS.** A model file is not a deliverable; a *reproducible
+record* of how it was made is. Without tracking you cannot answer "which
+data, which features, which code, which parameters produced the thing
+in production, and how did it score?" — and without a registry with
+aliases you end up hardcoding `v7` in the serving config. Without
+promotion criteria and an audit trail, "champion" is whatever someone
+last clicked.
+
+**HOW DATA/CONTROL FLOWS THROUGH IT.**
+1. `train`: read config → open Feast repo → read the feature view's
+   `version` tag → query the newest `max_rows` labels with
+   `label_timestamp <= as_of` → Feast point-in-time join (Postgres
+   offline store) → drop labels with no feature match (383 of 200k here:
+   their feature event was DLQ'd or not yet curated) → fingerprint the
+   frame → stratified split (test carved first, then validation) →
+   `mlflow.start_run` → log params/tags/`dataset_version.json`/
+   `feature_definitions.json`/dataset input → fit → evaluate on
+   validation *and* the untouched test split → log metrics, confusion
+   matrices (JSON + PNG), importances (CSV + PNG), tree shape → log the
+   model with an inferred signature and register it → alias
+   `candidate` → tag the version with git SHA, fingerprint, feature
+   view version, test metrics.
+2. `promote`: resolve the candidate (or `--version`) → fetch its run's
+   metrics → fetch the current champion's (if any) → `evaluate_promotion`
+   → on approval (or `--force`) set the `champion` alias, tag the
+   version (`promoted_by`, `promotion_reason`), tag the old champion
+   (`superseded_by`), insert `ml.model_promotions`.
+3. Serving (Milestone 5) loads `models:/higgs_decision_tree@champion`.
+
+**WHAT "REPRODUCIBLE" MEANS HERE.** Same `as_of` + same config → same
+dataset fingerprint → same split (seeded) → same tree (seeded) → the
+same metrics to every decimal. Proven: v2 and v3 (`as_of
+2026-09-19T21:00`) both fingerprint `ff72b440727cb949`, test accuracy
+0.689787603526583, ROC-AUC 0.7585938300843371. Two runs *without*
+`as_of` on a live table would legitimately differ — that is not
+non-determinism, it is new data, and the logged `as_of` lets you pin
+it afterwards.
+
+**IMPORTANT CODE FILES.**
+- `ml/training/src/amel_training/train.py` — read top to bottom; the
+  order (log inputs *before* fitting) is deliberate.
+- `ml/training/src/amel_training/promote.py` — `evaluate_promotion` is
+  the whole policy; `promote` is the side effects.
+- `ml/training/src/amel_training/provenance.py` — the fingerprint.
+- `libs/amel_db/alembic/versions/0004_ml_model_promotions.py`.
+- `infra/mlflow/Dockerfile`, the `mlflow`/`train` services in
+  `infra/docker-compose.yml`.
+- `DECISIONS.md` ADR-0006.
+
+**FAILURE MODES (exercised).**
+- Weak candidate (`max_depth=2`, test accuracy 0.6298) → promotion
+  rejected with three reasons, exit 2, champion unchanged.
+- MLflow at its memory cap on boot → topology trimmed (see MISTAKES.md).
+- MLflow 3 Host-header rejection → `--allowed-hosts`.
+- skops refusing the tree type → explicit trusted type.
+- Blank Compose env → `None` at the config boundary.
+
+**HOW TO TEST IT.**
+- Unit (`make test`): split determinism/stratification/partitioning,
+  fingerprint content-not-order sensitivity, metrics/confusion on a
+  perfect predictor, importance ordering, every promotion branch,
+  config parsing.
+- Integration: `make up` → `TRAINING_AS_OF=<iso> make train` twice →
+  compare `dataset_fingerprint` and metrics → `DECIDED_BY=<you> make
+  promote` → `make model-show` → `SELECT * FROM ml.model_promotions`.
+  MLflow UI at http://localhost:5000.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Experiment tracking vs model registry vs artifact store — three
+  different things MLflow bundles.
+- Aliases over stages/version numbers: why `@champion` is the only
+  reference serving should hold.
+- Dataset versioning by content fingerprint; why "the query" is not a
+  version.
+- Test split hygiene: carve it first, never tune on it.
+- Model signatures and why schema enforcement at inference is a
+  feature, not friction.
+- Promotion as policy + audit: separate the *decision function* from
+  the *side effects*, log both.
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "How do you make a training run reproducible when the training table
+  is append-only and live?" (pin selection with `as_of`, fingerprint
+  content, seed everything, log all of it)
+- "What is the difference between an MLflow run, a logged model, a
+  registered model version and an alias?"
+- "Design an auditable model promotion process." (criteria as config,
+  pure decision, alias flip + immutable audit row, forced overrides
+  recorded, serving reads the alias)
+- "Why would you refuse to pickle a model?" (skops / trusted types)
+- "Your tracking server is at its memory limit doing nothing — what do
+  you look at?" (worker count, side-car processes, caps)

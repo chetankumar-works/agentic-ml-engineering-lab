@@ -235,6 +235,68 @@ services:
       retries: 12
       start_period: 20s
 
+  # MLflow tracking server + registry (Milestone 4, DECISIONS.md ADR-0006).
+  # Always-on: training logs to it and inference (Milestone 5) resolves
+  # the champion alias through it. Memory-capped like every other
+  # non-core container on this 15 GB host.
+  mlflow:
+    build:
+      context: ..
+      dockerfile: infra/mlflow/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command:
+      - "--backend-store-uri=postgresql+psycopg2://amel:amel_dev_password@postgres:5432/mlflow"
+      - "--artifacts-destination=s3://mlflow"
+      - "--serve-artifacts"
+      - "--workers=2"
+      # MLflow 3 rejects unknown Host headers (DNS-rebinding guard); the
+      # in-network name and the host-published port must both be allowed.
+      - "--allowed-hosts=mlflow:5000,localhost:5000,127.0.0.1:5000"
+    environment:
+      # MLflow 3 also starts a job runner + two huey consumers (~500 MB)
+      # for its server-side jobs feature, which nothing here uses.
+      # With 4 workers the default footprint was 1 GB.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: amel
+      AWS_SECRET_ACCESS_KEY: amel_dev_password
+      AWS_REGION: us-east-1
+    ports:
+      - "5000:5000"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # One-shot training run (Milestone 4): `make train`, `make promote`.
+  train:
+    profiles: ["train"]
+    build:
+      context: ..
+      dockerfile: infra/training/Dockerfile
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      feast-apply:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
+      TRAINING_MLFLOW_TRACKING_URI: http://mlflow:5000
+      TRAINING_MAX_ROWS: ${TRAINING_MAX_ROWS:-200000}
+      TRAINING_AS_OF: ${TRAINING_AS_OF:-}
+      TRAINING_MAX_DEPTH: ${TRAINING_MAX_DEPTH:-8}
+      TRAINING_GIT_SHA: ${GIT_SHA:-}
+    mem_limit: 3g
+
   feast-materialize:
     profiles: ["feast-demo"]
     build:

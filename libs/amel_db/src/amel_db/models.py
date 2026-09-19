@@ -2,19 +2,20 @@
 
 The `landing` tables (Milestone 1: the stream ingestor's idempotent
 sink), `curated` tables and `control` pipeline-tracking tables
-(Milestone 2: the Airflow batch pipeline) are defined here. The `ml`,
-`audit`, and `finops` schema *namespaces* are provisioned by the initial
-migration (see `alembic/versions/0001_...py`) but have no tables yet —
-added only when the milestone that needs them is actually built — see
-ARCHITECTURE.md and PROJECT_STATE.md for the build order. Do not add
-tables here speculatively.
+(Milestone 2: the Airflow batch pipeline) and the `ml` promotion audit
+table (Milestone 4) are defined here. The `audit` and `finops` schema
+*namespaces* are provisioned by the initial migration (see
+`alembic/versions/0001_...py`) but have no tables yet — added only when
+the milestone that needs them is actually built — see ARCHITECTURE.md
+and PROJECT_STATE.md for the build order. Do not add tables here
+speculatively.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, SmallInteger, String, Text
+from sqlalchemy import JSON, Integer, SmallInteger, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -181,3 +182,29 @@ class PipelineRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class ModelPromotion(Base):
+    """Audit record of one alias promotion in the MLflow model registry
+    (Milestone 4). MLflow holds the *current* alias→version mapping; this
+    table holds the *history* with the decision context — criteria,
+    both sides' metrics, who decided, why — so a champion change is
+    explicit and reviewable after the fact, never a silent alias flip.
+    """
+
+    __tablename__ = "model_promotions"
+    __table_args__ = {"schema": "ml"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    version: Mapped[str] = mapped_column(String(32), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    from_alias: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_alias: Mapped[str] = mapped_column(String(32), nullable=False)
+    previous_champion_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decided_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    criteria: Mapped[dict] = mapped_column(JSON, nullable=False)
+    candidate_metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    champion_metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    promoted_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

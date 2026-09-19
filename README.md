@@ -19,8 +19,9 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 3 (Feast feature store over curated Postgres, Redis online
-store, feature server called from the Airflow DAG) on top of Milestone
+Milestone 4 (reproducible DecisionTree training through Feast's offline
+path, MLflow tracking + registry with audited candidate → champion
+promotion) on top of Milestone 3's Feast/Redis feature store, Milestone
 2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
 streaming ingestion — see `PROJECT_STATE.md` for current detail and
 `MILESTONE_REPORT.md` for measured acceptance evidence per milestone.
@@ -50,12 +51,17 @@ make smoke         # Milestone 1 acceptance check against a running `make up` st
 make feast-materialize   # Milestone 3: chunked backfill of curated features into Redis
 make feast-demo          # Milestone 3: historical (point-in-time) + online retrieval demo
 make failure-simulator-wedge   # pauses Kafka ~30s; simulator probes must go 503 and recover
+make train                     # Milestone 4: one training run -> MLflow, registered, aliased candidate
+make promote DECIDED_BY=you    # explicit, audited candidate -> champion (exit 2 if criteria fail)
+make model-show                # current candidate/champion
 make down          # stop everything
 ```
 
+MLflow UI: http://localhost:5000. Airflow UI: http://localhost:8080.
+
 Memory: this stack has been measured at roughly 5–6 GB resident with
 everything up (Kafka ~0.9 GB, Airflow ~1.5 GB, Redis ~0.5 GB at ~1M
-entities, feast-server ~0.2–0.4 GB). Every Feast container is
+entities, feast-server ~0.2–0.4 GB, MLflow ~0.5 GB). Every Feast container is
 memory-capped; do not run unbounded `feast materialize` — see
 `RUNBOOKS.md`.
 

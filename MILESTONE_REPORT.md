@@ -187,3 +187,46 @@ per-run materialization is synchronous (async + polling if windows grow);
 is tuned by chunk size for this machine; no dedicated ingestor
 failure-engineering script yet; Milestone 1–2 carry-overs unchanged
 (download hardening, training-dataset scan growth); no CI.
+
+## Milestone 4 — Training package + MLflow (2026-09-19, tag `milestone-4`)
+
+**Built.** `ml/training` (`amel-train train | promote | show`): config
+→ Feast offline retrieval pinned by `as_of` → seeded stratified split →
+`DecisionTreeClassifier` → metrics/confusion/importances/signature →
+MLflow run + registered version aliased `candidate`; `promote` applies
+config-driven criteria and writes an `ml.model_promotions` audit row
+(Alembic `0004`). MLflow 3.16.1 server (Postgres `mlflow` DB, MinIO
+artifacts proxied, 2 uvicorn workers, jobs off, 1 GB cap) and a `train`
+one-shot container (3 GB cap).
+
+**Acceptance and proof.**
+- Reproducible: two runs with `as_of=2026-09-19T21:00:00` → versions 2
+  and 3, same fingerprint `ff72b440727cb949`, **all 13 metrics
+  identical** (test accuracy 0.689787603526583, ROC-AUC
+  0.7585938300843371), 199,623 rows, ~36 s each, **peak 873 MiB**.
+- Registered: `higgs_decision_tree` v1–v4; each version tagged with git
+  SHA `a70d233`, fingerprint, `higgs_features:v1`, test metrics; 11
+  artifacts + model + dataset input per run; 82 objects in MinIO.
+- Promotion: v3 → champion (**approved**, reasons logged, audit row 1);
+  v4 (`max_depth=2`, accuracy 0.6298) → **rejected** with three reasons,
+  exit 2, champion unchanged. `make model-show` → candidate 4 /
+  champion 3.
+- MLflow footprint: 1,023 MiB with defaults → 483–534 MiB after tuning.
+- 80 unit tests, ruff/mypy clean.
+
+**Decisions.** ADR-0006 (single capped MLflow server with proxied
+artifacts; `as_of`-pinned datasets + content fingerprint as the
+definition of reproducible; criteria-as-config + pure decision +
+Postgres audit row; skops with one trusted type).
+
+**Bugs found and fixed.** MLflow at its memory cap on boot (4 workers +
+jobs subsystem); MLflow 3 `403 Invalid Host header` (`--allowed-hosts`,
+uvicorn-only); skops untrusted `sklearn.tree._tree.Tree`; blank Compose
+env vars parsed as bad datetimes; `mlflow` DB missing on an existing
+Postgres volume (init scripts are first-boot-only).
+
+**Known gaps at close.** Comparison on each run's own test split rather
+than a fixed holdout; 200k-row default, full-scale untimed; `train`
+rebuilds each invocation; MLflow single point of failure for model
+resolution (inference must cache); manual DB creation on existing
+volumes; earlier carry-overs unchanged.

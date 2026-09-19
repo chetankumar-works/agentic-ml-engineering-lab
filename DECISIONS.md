@@ -306,3 +306,87 @@ columnar scans over long history; move materialization to async
 (`POST /materialize?async=true` + polling) if a run's window ever
 approaches the task timeout; give the feature server its own registry
 cache TTL tuning if `feast apply` churn becomes frequent.
+
+## ADR-0006: MLflow as a capped single server, promotion as config + audit table, datasets pinned by `as_of`
+
+**Problem.** Milestone 4 needed (1) an MLflow tracking server and model
+registry that fits the memory budget, (2) a definition of "reproducible"
+that survives a dataset that grows every five minutes, and (3) a
+candidate → champion promotion that is explicit and auditable rather
+than a silent alias flip.
+
+**Decision.**
+1. **One `mlflow` container** (`infra/mlflow/Dockerfile`, pinned to the
+   same `mlflow==3.16.1` the training package resolved), backend store in
+   its own `mlflow` database on the shared Postgres (ADR-0004 pattern),
+   artifacts in the MinIO `mlflow` bucket **proxied by the server**
+   (`--serve-artifacts`, so clients need no MinIO credentials), uvicorn
+   with `--workers=2`, `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`,
+   `--allowed-hosts` set explicitly, `mem_limit: 1g`.
+2. **Training runs in a one-shot `train` container** built from the uv
+   workspace (Feast + MLflow + scikit-learn resolved together — no
+   isolation needed, unlike Airflow). `amel-train train | promote | show`
+   is the whole production interface; no notebook exists.
+3. **Reproducibility = same `as_of` + same config → same dataset
+   fingerprint → same metrics.** The training frame is "the most recent
+   `max_rows` labels with `label_timestamp <= as_of`", joined
+   point-in-time through Feast's offline path; `as_of` defaults to now
+   and is always logged, so any run can be re-pinned later. The
+   fingerprint is a SHA-256 over the sorted (entity_id, event_timestamp,
+   target) rows.
+4. **Promotion criteria live in config** (`TRAINING_PROMOTION_*`: an
+   absolute test-accuracy floor, a test-ROC-AUC floor, and a maximum
+   regression against the current champion), the decision is a pure
+   function (`evaluate_promotion`), and applying it writes both the
+   MLflow alias/tags **and** a row in `ml.model_promotions` (Alembic
+   `0004`) with who/why/criteria/both sides' metrics. `--force` is
+   allowed but recorded as forced. Serving (Milestone 5) resolves
+   `models:/higgs_decision_tree@champion` — never a version number.
+5. The sklearn model is logged in MLflow 3's default **skops** format
+   with `sklearn.tree._tree.Tree` declared trusted; the declaration is
+   stored in the MLmodel flavor config so loaders need nothing extra.
+
+**Reason.**
+1. The stock `mlflow server` in 3.x starts 4 gunicorn workers plus a job
+   runner and two huey consumers — measured **1,023 MiB, pinned at the
+   1 GB cap** on first boot. Nothing in AMEL uses server-side jobs; with
+   2 uvicorn workers and jobs off it is 483–534 MiB. `--serve-artifacts`
+   keeps MinIO credentials out of every training/inference container.
+   MLflow 3's DNS-rebinding guard rejects the in-network `mlflow:5000`
+   Host header unless allowed, and that guard only works with uvicorn —
+   hence no `--gunicorn-opts`.
+2. Reusing the workspace/Docker pattern from Feast keeps one lockfile
+   and one build recipe; `TRAINING_MAX_ROWS=200000` keeps a dev run at
+   ~36 s and a measured **peak 873 MiB** (3 GB cap); `0` trains on every
+   labelled row.
+3. "Same code, same seed" is not enough when the source table is
+   append-only and live: without `as_of`, two back-to-back runs see
+   different rows. Proven: runs v2 and v3 with `as_of=2026-09-19T21:00`
+   produced fingerprint `ff72b440727cb949` and bit-identical metrics.
+4. The registry's alias is the *current state*; the audit table is the
+   *history with reasons*. MLflow model-version tags carry the same
+   context so a reviewer sees it in the UI, but tags are mutable and
+   unordered — the Postgres row is the record. Criteria as config means
+   raising the bar is a config change with a paper trail, not a code
+   edit. Proven: v4 (`max_depth=2`, test accuracy 0.6298) was rejected
+   with three explicit reasons and `exit 2`; champion stayed v3.
+5. skops is safer than pickle for a model that will be loaded by a
+   long-running API; declaring exactly one trusted type is the narrow
+   exception the tool asks for.
+
+**Tradeoffs.** A single MLflow server is a single point of failure for
+training *and* (from Milestone 5) for model resolution at inference
+start-up — the inference API must cache the loaded champion and treat
+MLflow as needed only for refresh. `--serve-artifacts` routes every
+artifact byte through the server. The 200k default under-uses the data;
+full-scale runs are one env var away. `as_of` pins the *selection*, not
+the *content* of curated rows — an upstream re-curation that changed a
+feature value would change the fingerprint, which is the desired
+behaviour.
+
+**Future reconsideration trigger.** Add a champion-vs-candidate
+evaluation on a fixed, versioned holdout set (not each run's own test
+split) once model comparisons matter more than the mechanics; move
+promotion behind the platform API + JWT scope `models:promote`
+(Milestone 11+) so the agent path and the CLI path share one audited
+function.
