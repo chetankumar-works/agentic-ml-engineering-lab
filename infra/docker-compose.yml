@@ -275,6 +275,44 @@ services:
       retries: 12
       start_period: 20s
 
+  # Inference API (Milestone 5): serves models:/higgs_decision_tree@champion.
+  # Loads the model once at start-up (needs mlflow up *then*), caches it,
+  # refreshes only via POST /model/refresh or the optional poll.
+  inference-api:
+    build:
+      context: ..
+      dockerfile: apps/inference_api/Dockerfile
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      feast-server:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
+      INFERENCE_MLFLOW_TRACKING_URI: http://mlflow:5000
+      INFERENCE_FEAST_SERVER_URL: http://feast-server:6566
+      INFERENCE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      INFERENCE_MODEL_REFRESH_SECONDS: ${INFERENCE_MODEL_REFRESH_SECONDS:-0}
+      INFERENCE_ADMIN_TOKEN: ${INFERENCE_ADMIN_TOKEN:-dev-admin-token}
+      # MLflow's client retries 7x with exponential backoff by default —
+      # a refresh during an MLflow outage blocked for minutes. The cached
+      # model keeps serving regardless; the *refresh* should fail fast.
+      MLFLOW_HTTP_REQUEST_MAX_RETRIES: "2"
+      MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
+    ports:
+      - "8003:8003"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
   # One-shot training run (Milestone 4): `make train`, `make promote`.
   train:
     profiles: ["train"]

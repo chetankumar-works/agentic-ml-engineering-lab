@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 FEATURE_SCHEMA_VERSION = "1.0.0"
 LABEL_SCHEMA_VERSION = "1.0.0"
+PREDICTION_SCHEMA_VERSION = "1.0.0"
 
 HIGGS_FEATURE_NAMES: tuple[str, ...] = (
     "lepton_pt",
@@ -96,3 +97,26 @@ class LabelEvent(BaseModel):
     target: Annotated[int, Field(ge=0, le=1)]
     label_timestamp: datetime
     schema_version: str = LABEL_SCHEMA_VERSION
+
+
+class PredictionEvent(BaseModel):
+    """One served prediction, published to `predictions.v1` by
+    `apps/inference_api` (Milestone 5) after it has been persisted to
+    `ml.predictions`. Downstream consumers (platform events, FinOps,
+    monitoring) get exactly what the caller got — same ids, same model
+    version — never a re-derived value.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    prediction_id: str
+    entity_id: str | None
+    source: str  # "raw" | "entity"
+    model_name: str
+    model_version: str
+    model_run_id: str | None
+    prediction: Annotated[int, Field(ge=0, le=1)]
+    probability: Annotated[float, Field(ge=0.0, le=1.0)]
+    predicted_at: datetime
+    schema_version: str = PREDICTION_SCHEMA_VERSION
+    trace_id: str

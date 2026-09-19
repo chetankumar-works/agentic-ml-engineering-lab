@@ -390,3 +390,77 @@ split) once model comparisons matter more than the mechanics; move
 promotion behind the platform API + JWT scope `models:promote`
 (Milestone 11+) so the agent path and the CLI path share one audited
 function.
+
+## ADR-0007: Inference API — cached champion with controlled refresh, Feast over HTTP, persist-then-publish
+
+**Problem.** Milestone 5 needed `apps/inference_api` to serve
+`models:/higgs_decision_tree@champion` with predictions that carry model
+metadata, take features either raw or from the online store, persist
+every prediction, publish it to Kafka — and stay honest about its own
+health.
+
+**Decision.**
+1. **Model cache with atomic swap.** The champion is loaded once at
+   start-up and held in a `ModelCache`; refresh happens only via
+   `POST /model/refresh` (shared `X-Admin-Token` until JWT scopes arrive
+   with the platform API) or an optional poll
+   (`INFERENCE_MODEL_REFRESH_SECONDS`). A refresh loads the new version
+   fully before swapping under a lock; a failed load leaves the previous
+   model serving and records the error. Same alias → same version is a
+   no-op. MLflow client retries are capped (`MAX_RETRIES=2`,
+   `TIMEOUT=10`).
+2. **Feast over HTTP** (`feast-server /get-online-features`), not the
+   Feast SDK — the image carries mlflow + scikit-learn + pandas and
+   nothing of Feast's tree.
+3. **Persist, then publish.** `ml.predictions` (Alembic `0005`) is
+   written first and is the system of record; the `PredictionEvent`
+   (`predictions.v1`, shared schema in `amel_common`) is the
+   notification. Persistence failure is counted, logged and reported in
+   the response (`persisted: false`) — the prediction is still returned.
+4. **Probes:** `/health` is "the process can serve or recover" (always
+   200 unless the process is wedged); `/ready` is "a model is loaded and
+   feast-server, Postgres and Kafka delivery are healthy right now".
+   MLflow is deliberately *not* a readiness dependency: it is needed to
+   load, not to serve.
+5. Column order is pinned to `HIGGS_FEATURE_NAMES`, the same tuple that
+   defines the feature view and the training frame; raw requests must
+   contain exactly those 28 names.
+
+**Reason.**
+1. A registry lookup + artifact download + skops load per request is
+   both slow and a hard dependency on MLflow at request time. Proven:
+   with MLflow stopped, `/predict/entity` returned 200 and `/ready`
+   stayed 200; a refresh during the outage failed in 20 s (was minutes
+   with default retries) and left v5 serving; after MLflow returned the
+   next refresh cleared the error. "Controlled" is the point — promoting
+   a champion (Milestone 4) and *serving* it are two auditable actions;
+   the API log shows exactly when the swap happened (`model_swapped
+   previous=3 current=5`).
+2. Same reasoning as ADR-0005's feature server: dependency isolation,
+   one service boundary for online features, and the measured cost is
+   ~2 ms per fetch.
+3. If the row and the event disagree, the row wins; making the write
+   first means an event never refers to a prediction that does not
+   exist. Returning `persisted: false` instead of a 500 keeps the
+   product (the prediction) available during a database blip while
+   making the degradation visible to the caller and to `/ready`.
+4. The Milestone 3 lesson applied from day one: every readiness
+   dependency is something a prediction *right now* needs.
+5. The feature view, the training frame, the signature and the request
+   validator all derive from one tuple — that is the train/serve-skew
+   guarantee in code. Proven: the same entity through `/predict/entity`
+   (Redis) and `/predict/raw` (Postgres values) returned probability
+   `0.7061068702290076` both ways.
+
+**Tradeoffs.** A shared admin token is not real auth (documented,
+replaced in Milestone 11). Persistence/publishing are synchronous in the
+request path (~5.7 ms p50 end-to-end measured, so acceptable; a queue
+would decouple them at scale). No batch endpoint. No model warm-up
+beyond the initial load. Predictions are persisted with their full
+feature vector (audit-friendly, storage-hungry at scale).
+
+**Future reconsideration trigger.** Move refresh behind the platform
+API's `models:promote`/`deployments:write` scopes; add a canary
+(serve `@candidate` to a fraction of traffic) once there is traffic
+worth splitting; make persistence async if p95 latency matters more
+than write-before-publish ordering.

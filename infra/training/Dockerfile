@@ -10,6 +10,7 @@ COPY pyproject.toml uv.lock ./
 COPY libs ./libs
 COPY services ./services
 COPY ml ./ml
+COPY apps ./apps
 
 RUN uv sync --frozen --no-dev --package amel-training
 

@@ -230,3 +230,45 @@ than a fixed holdout; 200k-row default, full-scale untimed; `train`
 rebuilds each invocation; MLflow single point of failure for model
 resolution (inference must cache); manual DB creation on existing
 volumes; earlier carry-overs unchanged.
+
+## Milestone 5 — FastAPI inference (2026-09-19, tag `milestone-5`)
+
+**Built.** `apps/inference_api`: cached champion (`ModelCache`, atomic
+swap, controlled refresh via `POST /model/refresh` + optional poll),
+`POST /predict/raw` (validated 28 features) and
+`POST /predict/entity/{id}` (feast-server online features), persistence
+to `ml.predictions` (Alembic `0005`) before publishing a
+`PredictionEvent` to `predictions.v1`, `/model`, `/metrics`, honest
+`/health` + `/ready`. Compose service on :8003, 1 GB cap.
+
+**Acceptance and proof.**
+- Loads the champion at start-up (`model_swapped previous=null
+  current=3`); `/model` returns version, run id, git SHA, dataset
+  fingerprint, feature view.
+- Predictions carry model metadata + `prediction_id` + `trace_id`;
+  entity path and raw path agree to the last digit
+  (`0.7061068702290076`) for the same entity — online == offline.
+- **p50 5.7 ms / p95 6.8 ms** over 200 sequential entity predictions
+  including feature fetch, DB write and Kafka publish; 203 rows in
+  `ml.predictions`, matching events on `predictions.v1`.
+- Controlled refresh proven live: promotion alone left v3 serving;
+  refresh without token 401; with token `3 → 5`, next prediction from
+  v5.
+- MLflow stopped: predictions 200, `/ready` 200, refresh fails in
+  **20 s** (vs ~3 min before capping client retries), keeps serving;
+  error clears after recovery.
+- 404 on unknown entity, 422 on malformed raw input. ~246 MiB RSS.
+- 89 unit tests (80 → 89), ruff/mypy clean.
+
+**Decisions.** ADR-0007 (cache + controlled refresh; Feast over HTTP;
+persist-then-publish; readiness excludes the registry; one column-order
+source of truth).
+
+**Bugs found and fixed.** FastAPI dependency resolved as a query param
+under postponed annotations (closure-scoped dependency); refresh during
+an MLflow outage blocked ~3 min (client retries capped); stale
+`last_error` after a successful no-op refresh.
+
+**Known gaps at close.** Shared admin token until JWT (M11);
+synchronous persist/publish; no batch or canary endpoints; no
+`ml.model_metadata` mirror; earlier carry-overs.

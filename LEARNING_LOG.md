@@ -801,3 +801,95 @@ it afterwards.
 - "Why would you refuse to pickle a model?" (skops / trusted types)
 - "Your tracking server is at its memory limit doing nothing — what do
   you look at?" (worker count, side-car processes, caps)
+
+## Milestone 5 — FastAPI inference
+
+**WHAT WAS BUILT.** `apps/inference_api` (`inference-api`, FastAPI,
+port 8003): `GET /health`, `GET /ready`, `GET /model`,
+`POST /model/refresh` (admin token), `POST /predict/raw` (exactly the 28
+HIGGS features, validated), `POST /predict/entity/{entity_id}`
+(features from `feast-server`), `GET /metrics`. Modules: `model.py`
+(`ModelCache` + `mlflow_loader`), `features.py` (`FeastOnlineClient`),
+`store.py` (`ml.predictions`, Alembic `0005`), `publisher.py`
+(`predictions.v1`), `service.py` (the request-independent prediction
+path), `api.py`. `PredictionEvent` added to `amel_common.schemas`.
+ADR-0007.
+
+**WHY IT EXISTS.** The model is only useful if something serves it, and
+serving is where every earlier guarantee is cashed in: the same feature
+definitions (Feast), the champion alias (MLflow registry), honest probes
+(Milestone 3), a persisted record and an event per prediction so the
+platform (Milestone 11+) and FinOps (Milestone 16) can see what was
+served, by which version, when.
+
+**HOW A REQUEST FLOWS.**
+1. `X-Trace-Id` is honoured or minted (propagation groundwork for
+   Milestone 6's OpenTelemetry).
+2. `/predict/entity/{id}`: `POST feast-server /get-online-features` →
+   28 values or 404 if the entity has never been materialized.
+   `/predict/raw`: pydantic rejects anything but exactly the 28 names.
+3. A one-row DataFrame in `HIGGS_FEATURE_NAMES` order (the signature's
+   order) → `predict_proba` → label at 0.5.
+4. `ml.predictions` row (features, prediction, probability, model
+   name/version/run, latency, trace id) → `PredictionEvent` to
+   `predictions.v1` keyed by entity id → response with `prediction_id`,
+   model metadata (version, run id, git SHA, dataset fingerprint,
+   feature view), latency, trace id, `persisted`.
+
+**HOW THE MODEL GETS THERE AND CHANGES.** Start-up: resolve
+`@champion` → version → `mlflow.sklearn.load_model` (skops, trusted
+type from the MLmodel config) → cache. Change: an operator promotes in
+MLflow (Milestone 4), then calls `POST /model/refresh` — the API logs
+`model_swapped previous=3 current=5` and every response's `model.version`
+changes; nothing restarts. Proven live, including the negative cases
+(401 without the token, no-op when the alias has not moved, failure
+leaves the old model serving).
+
+**IMPORTANT CODE FILES.**
+- `apps/inference_api/src/inference_api/model.py` — read `refresh()`.
+- `apps/inference_api/src/inference_api/service.py` — the whole
+  prediction path without HTTP.
+- `apps/inference_api/src/inference_api/api.py` — `Probes.readiness`
+  and the `trace_id` note about `from __future__ import annotations`.
+- `apps/inference_api/tests/test_inference_api.py` — the fakes show
+  the seams.
+- `DECISIONS.md` ADR-0007.
+
+**FAILURE MODES (exercised).**
+- MLflow stopped: predictions 200, `/ready` 200, refresh fails in 20 s
+  with the previous model still serving, error clears on recovery.
+- Unknown entity → 404 with reason; malformed raw payload → 422 naming
+  the missing fields.
+- Persistence failure (unit): response 200 with `persisted: false`,
+  counter incremented, event still published.
+- feast-server / Postgres / Kafka delivery degraded (unit): `/ready`
+  503 with the specific reason; `/health` stays 200.
+- No model at start-up (unit): live, not ready, 503 on predict, ready
+  after a successful refresh.
+
+**HOW TO TEST IT.**
+- Unit (`make test`): the full request path against a real tiny tree
+  with fake loader/features/store/publisher — 9 tests.
+- Live: `make up`; `curl localhost:8003/model`; `curl -X POST
+  localhost:8003/predict/entity/<id>`; `SELECT * FROM ml.predictions`;
+  `kafka-console-consumer --topic predictions.v1`; promote a new
+  champion and `POST /model/refresh` with `X-Admin-Token`.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Why model loading is a start-up/refresh concern and never a request
+  concern; atomic swap under a lock.
+- Readiness dependencies = what *this request* needs; MLflow is not one.
+- Persist-then-publish and "the row is the record, the event is the
+  notification".
+- Train/serve skew guarded by a single source of column order.
+- Trace-id propagation before tracing exists.
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "How do you roll a new model into a running API without a restart,
+  and how do you roll back?" (alias → controlled refresh; re-alias +
+  refresh)
+- "Your model registry is down. What breaks?" (nothing at request
+  time if the model is cached; refresh fails fast and reports)
+- "Where do you validate inference inputs and why exactly there?"
+- "What do you persist per prediction and what do you publish?"
+- "Why does readiness not check the registry?"

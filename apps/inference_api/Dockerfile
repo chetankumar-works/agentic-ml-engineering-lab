@@ -9,11 +9,13 @@ COPY services ./services
 COPY ml ./ml
 COPY apps ./apps
 
-RUN uv sync --frozen --no-dev --package source-simulator
+RUN uv sync --frozen --no-dev --package inference-api
 
-ENV PATH="/app/.venv/bin:$PATH"
-RUN useradd --create-home --uid 1000 amel && mkdir -p /data && chown amel:amel /data
+ENV PATH="/app/.venv/bin:$PATH" \
+    MLFLOW_DISABLE_AGENT_HINT=1 \
+    GIT_PYTHON_REFRESH=quiet
+RUN useradd --create-home --uid 1000 amel
 USER amel
 
-EXPOSE 8001
-CMD ["python", "-m", "source_simulator"]
+EXPOSE 8003
+CMD ["python", "-m", "inference_api"]

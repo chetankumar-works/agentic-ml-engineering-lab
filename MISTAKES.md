@@ -299,3 +299,28 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
 - **Fix**: created it by hand; runbook entry added.
 - **Lesson**: anything under `docker-entrypoint-initdb.d` is
   first-boot-only — plan the manual step for existing volumes.
+
+## Milestone 5 — FastAPI inference
+
+### A FastAPI dependency silently became a required query parameter
+- **What happened**: every `/predict/*` test returned 422 `query.tid:
+  Field required`.
+- **Root cause**: `from __future__ import annotations` makes annotations
+  strings; FastAPI evaluates `Annotated[str, Depends(trace_id)]` against
+  the module's globals, and `trace_id` was a closure inside
+  `create_app` — so the annotation resolved to a plain `str` query param.
+- **Fix**: module-level dependency function (comment left in place).
+- **Lesson**: with postponed annotations, anything referenced inside an
+  annotation must be importable at module scope.
+
+### A refresh during an MLflow outage blocked for minutes
+- **What happened**: `POST /model/refresh` with MLflow stopped hung
+  ~3 minutes before returning the error.
+- **Root cause**: MLflow's REST client retries 7× with exponential
+  backoff by default.
+- **Fix**: `MLFLOW_HTTP_REQUEST_MAX_RETRIES=2`,
+  `MLFLOW_HTTP_REQUEST_TIMEOUT=10` for the API (20 s measured). Also:
+  a successful no-op refresh now clears `last_error`, which had been
+  left stale from the failed attempt.
+- **Lesson**: a cached-model design only pays off if the *refresh* path
+  also fails fast; client library defaults assume you want to wait.

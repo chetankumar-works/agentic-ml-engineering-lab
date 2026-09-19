@@ -2,9 +2,9 @@
 
 The `landing` tables (Milestone 1: the stream ingestor's idempotent
 sink), `curated` tables and `control` pipeline-tracking tables
-(Milestone 2: the Airflow batch pipeline) and the `ml` promotion audit
-table (Milestone 4) are defined here. The `audit` and `finops` schema
-*namespaces* are provisioned by the initial migration (see
+(Milestone 2: the Airflow batch pipeline), the `ml` promotion audit
+table (Milestone 4) and `ml.predictions` (Milestone 5) are defined
+here. The `audit` and `finops` schema *namespaces* are provisioned by the initial migration (see
 `alembic/versions/0001_...py`) but have no tables yet — added only when
 the milestone that needs them is actually built — see ARCHITECTURE.md
 and PROJECT_STATE.md for the build order. Do not add tables here
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Integer, SmallInteger, String, Text
+from sqlalchemy import JSON, Float, Integer, SmallInteger, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -208,3 +208,28 @@ class ModelPromotion(Base):
     candidate_metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
     champion_metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     promoted_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+
+
+class Prediction(Base):
+    """One served prediction (Milestone 5). Written by `apps/inference_api`
+    before the matching `PredictionEvent` is published to `predictions.v1`;
+    the row is the system of record, the event is the notification.
+    """
+
+    __tablename__ = "predictions"
+    __table_args__ = {"schema": "ml"}
+
+    prediction_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    entity_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    model_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    features: Mapped[dict] = mapped_column(JSON, nullable=False)
+    prediction: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    probability: Mapped[float] = mapped_column(Float, nullable=False)
+    latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    trace_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        index=True, server_default=func.now(), nullable=False
+    )

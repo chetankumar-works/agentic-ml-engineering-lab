@@ -19,9 +19,10 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 4 (reproducible DecisionTree training through Feast's offline
-path, MLflow tracking + registry with audited candidate → champion
-promotion) on top of Milestone 3's Feast/Redis feature store, Milestone
+Milestone 5 (FastAPI inference serving the cached MLflow champion over
+raw or Feast-online features, persisting and publishing every
+prediction) on top of Milestone 4's reproducible training + MLflow
+registry, Milestone 3's Feast/Redis feature store, Milestone
 2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
 streaming ingestion — see `PROJECT_STATE.md` for current detail and
 `MILESTONE_REPORT.md` for measured acceptance evidence per milestone.
@@ -58,10 +59,12 @@ make down          # stop everything
 ```
 
 MLflow UI: http://localhost:5000. Airflow UI: http://localhost:8080.
+Inference API: http://localhost:8003/docs (OpenAPI).
 
 Memory: this stack has been measured at roughly 5–6 GB resident with
 everything up (Kafka ~0.9 GB, Airflow ~1.5 GB, Redis ~0.5 GB at ~1M
-entities, feast-server ~0.2–0.4 GB, MLflow ~0.5 GB). Every Feast container is
+entities, feast-server ~0.2–0.4 GB, MLflow ~0.5 GB, inference-api
+~0.25 GB). Every Feast container is
 memory-capped; do not run unbounded `feast materialize` — see
 `RUNBOOKS.md`.
 

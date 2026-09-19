@@ -363,3 +363,28 @@ group** for an hour.
   `ml.model_promotions.reason` as `FORCED by operator`. Never edit the
   alias in the MLflow UI: that bypasses the audit row.
 - Verify: `SELECT * FROM ml.model_promotions ORDER BY id DESC LIMIT 3;`
+
+## inference_api serves a stale champion after a promotion
+
+- Symptom: `make model-show` says champion = N but `curl
+  localhost:8003/model` shows an older version; predictions carry the
+  old `model.version`.
+- Cause: by design. Promotion changes the registry; serving changes on
+  refresh (`INFERENCE_MODEL_REFRESH_SECONDS=0` means manual only).
+- Recovery: `curl -X POST localhost:8003/model/refresh -H
+  "X-Admin-Token: $INFERENCE_ADMIN_TOKEN"` → expect `"swapped": true`.
+  If `"error"` is set, MLflow is unreachable: the previous model keeps
+  serving; fix MLflow, refresh again (the error clears on the next
+  successful call, even a no-op).
+- Rollback: `make promote PROMOTE_ARGS="--version <old> --force"` (or
+  re-alias in MLflow with a matching audit row), then refresh.
+
+## inference_api /ready is 503
+
+- Read the body — it names the dependency: `no model loaded: ...`
+  (initial load failed; check MLflow and refresh), `feast-server
+  unreachable`, `database unreachable: ...`, `kafka delivery failing:
+  ...`. `/health` stays 200 in all of these; only the process being
+  wedged should fail liveness.
+- `curl localhost:8003/metrics | grep amel_inference_` for
+  `persist_failures_total` / `publish_failures_total` trends.

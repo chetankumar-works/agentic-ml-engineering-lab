@@ -107,7 +107,7 @@ to record.
 
 ## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
 
-Three views, all of what is **built** as of Milestone 4 unless a node is
+Three views, all of what is **built** as of Milestone 5 unless a node is
 marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
 
 ### System context
@@ -124,15 +124,15 @@ flowchart LR
         af["Airflow: higgs_pipeline"]
         fs["Feast feature server"]
         ml["MLflow tracking + registry"]
-        inf["inference_api<br/>(planned, M5)"]
+        inf["inference_api"]
         plat["platform_api / agents<br/>(planned, M11+)"]
     end
 
-    amel -->|"predictions"| clients(["API clients<br/>(planned)"])
+    amel -->|"POST /predict/raw, /predict/entity/{id}"| clients(["API clients"])
     amel -->|"metrics, traces, logs"| obs["Prometheus / Grafana / Tempo / Loki<br/>(planned, M6)"]
 ```
 
-### End-to-end data flow (built through Milestone 4)
+### End-to-end data flow (built through Milestone 5)
 
 ```mermaid
 flowchart TB
@@ -174,9 +174,12 @@ flowchart TB
         promote -->|"ml.model_promotions"| curated
     end
 
-    subgraph consumers ["Consumers"]
-        redis -->|"get_online_features<br/>latest values"| infer["inference_api<br/>(planned, M5)"]
-        registry_m -->|"models:/...@champion"| infer
+    subgraph serving ["Milestone 5 — serving"]
+        registry_m -->|"models:/...@champion<br/>loaded once, POST /model/refresh"| infer["inference_api<br/>:8003"]
+        server -->|"POST /get-online-features"| infer
+        client(["caller"]) -->|"POST /predict/entity/{id}<br/>POST /predict/raw"| infer
+        infer -->|"ml.predictions (record)"| curated
+        infer -->|"predictions.v1 (notification)"| kafka
     end
 ```
 
@@ -215,12 +218,16 @@ flowchart LR
         m4c["Alembic 0004<br/>ml.model_promotions audit"]
         m4d["as_of-pinned datasets<br/>content fingerprint"]
     end
-    subgraph next ["M5+ (planned)"]
-        m5["inference_api / platform_api"]
+    subgraph M5 ["M5 — inference"]
+        m5a["apps/inference_api<br/>cached champion, controlled refresh"]
+        m5b["Alembic 0005 ml.predictions<br/>PredictionEvent -> predictions.v1"]
+    end
+    subgraph next ["M6+ (planned)"]
+        m5["platform_api"]
         m6["OpenTelemetry stack"]
         m8["Kubernetes"]
     end
-    M0 --> M1 --> M2 --> M3 --> M4 --> next
+    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> next
 ```
 
 
@@ -269,7 +276,7 @@ Each layer is built only after the one below it demonstrably works — see
 `PROJECT_STATE.md`'s milestone list for the authoritative sequencing and
 current status.
 
-## Data flow, current (Milestone 4)
+## Data flow, current (Milestone 5)
 
 ```
 UCI HIGGS zip (downloaded once, streamed row-by-row, never fully
@@ -322,6 +329,14 @@ Training + registry (ml/training, DECISIONS.md ADR-0006):
                       → registered higgs_decision_tree vN, alias @candidate
   amel-train promote  criteria (config) → alias @champion + ml.model_promotions audit row
   mlflow server       Postgres db `mlflow` (metadata), MinIO bucket `mlflow` (artifacts, proxied)
+
+Serving (apps/inference_api, DECISIONS.md ADR-0007):
+  start-up            models:/higgs_decision_tree@champion → ModelCache (skops load once)
+  POST /predict/entity/{id}   feast-server /get-online-features → predict → ml.predictions row
+                              → PredictionEvent to predictions.v1 → response (prediction_id, model metadata)
+  POST /predict/raw           validated 28 features → same path
+  POST /model/refresh         (X-Admin-Token) reload alias, atomic swap; failure keeps serving
+  /health = process ok · /ready = model loaded + feast-server + Postgres + Kafka delivery
 ```
 
 Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
@@ -371,6 +386,10 @@ during each acceptance run, and what was actually verified:
   bit-identical (proven); every run logs its inputs before fitting;
   promotion is a config-driven decision with an immutable audit row, and
   serving only ever references the `champion` alias.
+- **Serving isolated from the registry** (Milestone 5): the champion is
+  cached and swapped atomically on a controlled refresh; MLflow being
+  down does not affect predictions (proven), and every prediction is
+  persisted before it is published.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 
