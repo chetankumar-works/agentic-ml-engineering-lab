@@ -11,6 +11,10 @@ DB_WRITE_FAILURES = Counter(
     "amel_ingestor_db_write_failures_total",
     "Batch DB write attempts that raised an exception (before a successful retry, if any)",
 )
+OFFSET_COMMIT_FAILURES = Counter(
+    "amel_ingestor_offset_commit_failures_total",
+    "Offset commits the broker rejected (group eviction during a stall); the batch is redelivered",
+)
 OFFSET_COMMITS = Counter(
     "amel_ingestor_offset_commits_total",
     "Successful Kafka offset commit calls",

@@ -160,3 +160,160 @@ rebuild, briefly overlapping in execution.
 - **Prevention/follow-up**: none further needed — the same `GREATEST`
   pattern should be used for any future checkpoint/watermark value that
   can be written by more than one execution context.
+
+## feast materialize OOM-killed (and can take the whole WSL2 VM with it)
+
+Exercised 2026-09-19: `feast materialize-incremental` over the ~885k-row
+`curated.higgs_features_flat` view was killed by the kernel OOM killer at
+**12.1 GB RSS** (`dmesg`: `Out of memory: Killed process ... (feast)
+anon-rss:12147616kB`). The first Milestone 3 attempt, on a machine with
+~18 unrelated containers also running, froze WSL2 outright at the same
+step.
+
+- Symptom: the `feast-materialize` container prints `Killed` and exits
+  (exit code 0 through `docker compose run`, misleadingly — check
+  `docker events --filter event=oom` or `dmesg | grep -i oom`); Redis
+  `DBSIZE` is 0 or far below the curated row count; in the worst case
+  WSL2 itself freezes and Docker Desktop has to be restarted.
+- Likely causes: (1) an unbounded materialization window — Feast's
+  Postgres offline store loads every row in the window into memory and
+  converts each to protobufs, ~14 KB/row; (2) other memory-hungry
+  containers leaving no headroom.
+- Diagnosis steps:
+  ```bash
+  dmesg | grep -i 'out of memory'            # was it the global OOM killer?
+  docker events --since 30m --filter event=oom --format '{{.Actor.Attributes.name}}'
+  docker exec amel-redis-1 redis-cli DBSIZE  # vs:
+  docker exec amel-postgres-1 psql -U amel -d amel -tAc "SELECT count(*) FROM curated.higgs_features"
+  free -g; docker ps --format '{{.Names}}' | wc -l   # what else is eating memory?
+  ```
+- Recovery: assume Redis holds a partial materialization and wipe it —
+  it is entirely derived state. Then re-run the *chunked* backfill:
+  ```bash
+  docker exec amel-redis-1 redis-cli FLUSHALL
+  make feast-materialize      # scripts/materialize.py: ≤25k rows per window, resumes from the registry
+  docker exec amel-redis-1 redis-cli DBSIZE   # must equal count(*) of curated.higgs_features
+  ```
+  If WSL2 froze: restart Docker Desktop, `make down`, `docker volume rm
+  amel_redis-data`, `make up`, then the steps above.
+- Data-loss implications: none — the online store is rebuilt from
+  Postgres; nothing upstream is touched.
+- Prevention/follow-up: never call `feast materialize` /
+  `materialize-incremental` directly over this table; every Feast
+  container now has a `mem_limit` (1–2 GB) so the blast radius is the
+  container, not the VM; `scripts/materialize.py` and the Airflow task
+  both chunk (measured peak 875 MiB for the full backfill). Stop
+  unrelated containers before heavy runs — `docker ps` should show only
+  `amel-*`.
+
+## Feast offline queries fail with "server does not support SSL"
+
+- Symptom: any historical retrieval or materialization fails with
+  `psycopg ... server does not support SSL, but SSL was required`.
+- Likely cause: Feast's Postgres offline store defaults `sslmode` to
+  `require`; the local `postgres:16-alpine` has no SSL configured.
+- Recovery: `sslmode: disable` under `offline_store:` in
+  `ml/feature_repo/feature_store.yaml` (already set); re-run
+  `feast-apply`.
+- Prevention: keep the comment in `feature_store.yaml`; a production
+  Postgres with TLS should flip this back to `require`.
+
+## source_simulator producer wedge (Kafka stops accepting writes; /health lied)
+
+Incident 2026-09-19: during a broker stall (Kafka starved by the OOM
+above, plus a 2000 events/s burst) librdkafka timed out every in-flight
+message (`_MSG_TIMED_OUT`), the publishing loop thread died on an
+uncaught exception, and **`/health` kept returning 200 for over an
+hour** while `rows_read` sat frozen at 184,052. Now reproduced on demand
+by `make failure-simulator-wedge`
+(`scripts/failure_engineering/simulator_producer_wedge.py`).
+
+- Symptom: `curl localhost:8001/status` shows `counters.rows_read` not
+  advancing; container CPU ~0%; `kafka_delivery_failed` errors in the
+  simulator log; landing tables stop growing. After the fix: `/ready`
+  is 503 with `kafka delivery failing: ...`, `/health` is 503 only if
+  the loop actually died or librdkafka declared a fatal error.
+- Likely causes: broker paused/overloaded/restarting; local producer
+  queue full (`BufferError`) after a failed flush; idempotent-producer
+  fatal error after a sequence gap.
+- Diagnosis steps:
+  ```bash
+  curl -s localhost:8001/ready; echo; curl -s localhost:8001/health; echo
+  curl -s localhost:8001/status | python3 -m json.tool | sed -n '/producer_health/,/}/p'
+  docker logs --since 5m amel-source-simulator-1 | grep -c kafka_delivery_failed
+  docker inspect -f '{{.State.Health.Status}}' amel-kafka-1
+  ```
+- Recovery: fix Kafka first. If `/health` is 200 the simulator recovers
+  on its own once deliveries succeed (`/ready` flips back to 200 —
+  verified: 0 s after `docker compose unpause kafka`). If `/health` is
+  503, restart it: `docker compose -f infra/docker-compose.yml restart
+  source-simulator` — and set `HIGGS_START_INDEX` first (next entry).
+- Data-loss implications: events that timed out were never acked and
+  are counted in `events_dropped`; the simulator is a *source*, so
+  "loss" here just means fewer synthetic rows — nothing downstream is
+  corrupted.
+- Prevention/follow-up: delivery reports now feed the probes
+  (`SimulatorRunner.record_delivery`); the loop catches publish errors
+  and keeps going (dropping + counting) unless fatal;
+  `KAFKA_MESSAGE_TIMEOUT_MS` defaults to 30 s (librdkafka's 300 s hid
+  the outage for five minutes). Milestone 8's liveness/readiness probes
+  point at `/health` and `/ready` — this entry is why they can be
+  trusted. `make failure-simulator-wedge` is the regression test
+  (measured: `/ready` → 503 after 32 s, 294 delivery failures recorded,
+  self-recovery on unpause, `/health` correctly stayed 200).
+
+## stream_ingestor evicted from its consumer group (commit rejected; /health lied)
+
+Incident 2026-09-19, same root event as above: Kafka was starved long
+enough that the broker dropped the ingestor from the group; the next
+offset commit raised `KafkaException: Commit failed: Broker: Unknown
+member`, which was uncaught, killed the consume loop thread, and left
+`/health` at 200 with **~870k messages of lag and zero consumers in the
+group** for an hour.
+
+- Symptom: landing tables stop growing while the simulator's counters
+  advance; `kafka-consumer-groups --describe --group stream-ingestor`
+  shows `CONSUMER-ID -` (no members) and growing `LAG`;
+  `stream_ingestor_stopped` followed by a `KafkaException` traceback in
+  the container log. After the fix: `/health` 503 (`consume loop died:
+  ...`) if the loop is dead, `/ready` 503 (`no partition assignment` /
+  `last offset commit rejected: ...`) while degraded.
+- Diagnosis steps:
+  ```bash
+  curl -s localhost:8002/status; echo
+  docker run --rm --network amel_default confluentinc/cp-kafka:latest \
+    kafka-consumer-groups --bootstrap-server kafka:9092 --describe --group stream-ingestor
+  docker logs amel-stream-ingestor-1 2>&1 | grep -v /health | tail -20
+  ```
+- Recovery: a rejected commit no longer kills the loop — the next poll
+  rejoins the group and Kafka redelivers from the last committed offset;
+  the idempotent sink absorbs the redelivery (`duplicate_events_skipped`
+  in the log is expected). If `/health` is 503, `docker compose -f
+  infra/docker-compose.yml restart stream-ingestor`; it drains the
+  backlog (measured ~870k messages, mostly duplicates, in ~3 minutes).
+- Data-loss implications: none — offsets were never committed for the
+  affected batch, so nothing was skipped; rows written before the
+  rejected commit are simply re-upserted as no-ops.
+- Prevention/follow-up: `KafkaException` on commit is caught and
+  surfaces through `/ready`; any other loop death is recorded and fails
+  `/health`; `on_revoke`/`on_lost` clear readiness. Unit tests in
+  `services/stream_ingestor/tests/test_ingestor_probes.py`.
+
+## source_simulator restarted: every event is a duplicate, no new curated data
+
+- Symptom: after any simulator restart, `duplicate_events_skipped`
+  fills the ingestor log, landing/curated row counts stay flat, DAG runs
+  succeed with 0 rows, `update_feature_store` reports
+  `nothing_to_materialize`.
+- Likely cause: `entity_id` is `higgs-{index}` from a counter that
+  restarts at 0 on every boot; with ~885k ids already landed, the
+  simulator replays ~2.5 hours of already-seen ids at 100 events/s
+  before producing anything new.
+- Recovery: restart it with the counter set past what has landed:
+  ```bash
+  MAXID=$(docker exec amel-postgres-1 psql -U amel -d amel -tAc "SELECT max(entity_id) FROM landing.higgs_feature_events")
+  HIGGS_START_INDEX=$(( 10#${MAXID#higgs-} + 1 )) docker compose -f infra/docker-compose.yml up -d --no-deps source-simulator
+  ```
+- Prevention/follow-up: `HIGGS_START_INDEX` (config + `.env.example`);
+  a future improvement is to have the simulator persist its own
+  position, which Milestone 8's stateful deployment would need anyway.

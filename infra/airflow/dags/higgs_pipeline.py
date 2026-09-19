@@ -2,7 +2,7 @@
 
     determine_high_watermark -> extract_new_records -> write_bronze
     -> validate -> transform -> write_silver -> update_curated_tables
-    -> build_training_dataset -> update_feature_store
+    -> build_training_dataset -> update_feature_store (Feast -> Redis)
     -> emit_pipeline_metadata
 
 Business logic lives in `higgs_pipeline_tasks.py` (Airflow-independent,
@@ -50,6 +50,7 @@ logger = get_logger(component="higgs_pipeline")
 STAGING_DIR = os.environ.get("PIPELINE_STAGING_DIR", "/opt/airflow/staging")
 MAX_INVALID_FRACTION = float(os.environ.get("VALIDATION_MAX_INVALID_FRACTION", "0.05"))
 SCHEDULE = os.environ.get("HIGGS_PIPELINE_SCHEDULE", "*/5 * * * *")
+FEAST_SERVER_URL = os.environ.get("FEAST_SERVER_URL", "http://feast-server:6566")
 
 
 def _naive(dt: datetime) -> datetime:
@@ -272,12 +273,14 @@ def higgs_pipeline() -> None:
         return {"training_records_new": new_count, "gold_training_key": gold_key}
 
     @task
-    def update_feature_store_task(_gold: dict[str, Any]) -> dict[str, str]:
-        logger.info(
-            "update_feature_store_skipped",
-            reason="Feast feature store lands in Milestone 3 — deliberate no-op stub",
-        )
-        return {"status": "skipped_not_yet_implemented"}
+    def update_feature_store_task(_gold: dict[str, Any], **context: Any) -> dict[str, Any]:
+        # Runs after build_training_dataset only for ordering/clarity — it
+        # reads this run's rows from curated.higgs_features (by
+        # source_run_id), not the gold dataset. See tasks.update_feature_store.
+        run_id = context["run_id"]
+        result = tasks.update_feature_store(run_id, FEAST_SERVER_URL)
+        logger.info("update_feature_store_done", run_id=run_id, **result)
+        return result
 
     @task
     def emit_pipeline_metadata_task(
@@ -288,7 +291,7 @@ def higgs_pipeline() -> None:
         silver: dict[str, str],
         curated: dict[str, int],
         gold: dict[str, Any],
-        _feature_store: dict[str, str],
+        _feature_store: dict[str, Any],
         **context: Any,
     ) -> None:
         run_id = context["run_id"]

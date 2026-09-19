@@ -15,7 +15,7 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["libs/*", "services/*"]
+members = ["libs/*", "services/*", "ml/*"]
 
 [tool.ruff]
 target-version = "py312"
@@ -63,7 +63,7 @@ module = ["airflow.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "libs", "services", "infra/airflow"]
+testpaths = ["tests", "libs", "services", "infra/airflow", "ml"]
 addopts = "-ra"
 
 [tool.uv]

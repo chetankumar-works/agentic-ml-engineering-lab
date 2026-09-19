@@ -210,3 +210,99 @@ a later milestone needs to demonstrate genuinely distributed task
 execution, revisit both the executor (LocalExecutor → CeleryExecutor or
 KubernetesExecutor) and the local-staging hand-off pattern in the DAG
 tasks together — they're coupled, per the tradeoff above.
+
+## ADR-0005: Feast on a Postgres offline store + SQL registry, Redis online, an always-on feature server, and chunked materialization
+
+**Problem.** Milestone 3 needed a feature store with (1) an offline
+source for point-in-time-correct training retrieval, (2) an online store
+for low-latency inference lookups, (3) a registry, (4) a way for the
+scheduled Airflow DAG to materialize newly curated rows into the online
+store every five minutes, and (5) all of it inside a 15 GB WSL2 machine
+that had already been crashed twice by memory exhaustion.
+
+**Decision.**
+1. **Offline store: Feast's Postgres offline store over
+   `curated.higgs_features_flat`**, a VIEW (Alembic `0003`) that flattens
+   `curated.higgs_features.features` (JSONB, one blob per event) into 28
+   typed `float8` columns. Not the silver/gold Parquet in MinIO.
+2. **Registry: Feast's SQL registry in its own `feast` database** on the
+   existing Postgres container (same pattern as Airflow's metadata DB,
+   ADR-0004). Not the default local `registry.db` file.
+3. **Online store: Redis 7** (`redis-data` volume, host port 6380).
+4. **Materialization runs in a long-running `feast-server` container**
+   (`feast serve`, memory-capped at 1 GB), and the Airflow task
+   `update_feature_store` calls its `POST /materialize` over HTTP. Feast
+   is *not* installed in the Airflow image.
+5. **All materialization is chunked** — the one-shot backfill
+   (`ml/feature_repo/scripts/materialize.py`) and the per-run Airflow
+   task both split their window into ≤25,000-row sub-windows (boundaries
+   computed in SQL from actual row density) and call
+   `store.materialize(start, end)` / `POST /materialize` once per
+   sub-window. Never `feast materialize-incremental` over an unbounded
+   window.
+
+**Reason.**
+1. Postgres vs Parquet offline store. `curated.higgs_features` is
+   *already* the deduplicated, accumulated source of truth that
+   Milestone 2 built (idempotent upserts, watermark-gated), and it has an
+   index on `event_timestamp` — Feast's point-in-time join becomes an
+   indexed SQL query on data that is never stale relative to the
+   pipeline. The Parquet alternative (`silver/` in MinIO) is keyed by
+   `run_id`, so one entity's row can exist in several objects (re-runs,
+   wide re-extraction windows) and Feast's file offline store would have
+   to scan every object to find the latest — correct only by accident of
+   dedup, and slow. The cost of the Postgres choice is that Feast wants
+   one column per feature, hence the VIEW: zero extra storage, generated
+   from `HIGGS_FEATURE_NAMES` so it cannot drift from the feature list.
+   The Parquet route becomes the right answer when the offline history
+   outgrows Postgres (billions of rows, columnar scans for training) —
+   the swap is one `source=` line in `definitions.py`, and this ADR is
+   the trigger to revisit.
+2. A file registry is a single local file that every Feast process
+   (apply, server, demo, Airflow-side materialize) would need to share
+   via a volume, and it has no concurrency story. The SQL registry gives
+   every container the same registry over the network, plus
+   `feature_view_version_history` for free — which is how "feature
+   versioning" is actually tracked, alongside the explicit
+   `tags={"version": ...}` on the view.
+3. Redis is what the kickoff spec asks for and what Feast's online path
+   is designed around: one key per entity, latest value only, ~0.5 KB
+   per entity here (495 MB for 937k entities).
+4. Always-on server vs the alternatives, and why this was a *deliberate*
+   choice on a memory-starved machine: the DAG runs every 5 minutes, so
+   whatever materializes must be reachable on that cadence. "On demand"
+   would mean either Airflow spawning containers (needs the Docker
+   socket inside Airflow — a real security/complexity step) or importing
+   Feast in the Airflow image (Feast's dependency tree is exactly the
+   kind ADR-0004 kept out of that image). One idle uvicorn process costs
+   165 MB (measured; 361 MB after serving materialize calls), and the
+   `mem_limit: 1g` means a runaway is OOM-killed *inside its container*
+   rather than taking WSL2 down. Calling a feature-store *service* from
+   the orchestrator is also how this boundary looks in production.
+5. Feast's Postgres offline store materializes a window by loading every
+   row into memory and converting each to protobufs — measured at
+   ~14 KB/row, i.e. **12.1 GB RSS over the 885k-row table**, which the
+   kernel OOM-killed (and which is almost certainly what crashed WSL2
+   during the first Milestone 3 attempt, see RUNBOOKS.md). Chunking by
+   row count bounds peak memory by chunk size, not table size: the same
+   backfill ran at a measured peak of 875 MiB in 36 windows / 167 s.
+   Feast records each window in the registry, so a re-run resumes.
+
+**Tradeoffs.** Every container that touches Feast needs Postgres *and*
+Redis reachable (no offline-only mode). The VIEW recomputes JSON
+extraction on every read — fine at this scale with the timestamp index
+doing the filtering; a materialized view or a real flat table is the
+next step if offline reads become slow. `feast-server` is one more
+always-on process (~165–360 MB). Per-run materialization is
+synchronous inside the Airflow task (bounded by the 10-minute task
+timeout; a 5-minute window at 100 events/s is ~30k rows, two
+sub-windows, well under a minute). The Feast Postgres offline store
+defaults to `sslmode=require`, which the local Postgres does not support
+— `sslmode: disable` is set explicitly in `feature_store.yaml`.
+
+**Future reconsideration trigger.** Move the offline source to
+Parquet/MinIO when `curated` outgrows Postgres or training needs
+columnar scans over long history; move materialization to async
+(`POST /materialize?async=true` + polling) if a run's window ever
+approaches the task timeout; give the feature server its own registry
+cache TTL tuning if `feast apply` churn becomes frequent.

@@ -177,3 +177,74 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
 - **More on all of the above**: `LEARNING_LOG.md`'s Milestone 2 entry
   (full data-flow/idempotency argument) and `RUNBOOKS.md` (operational
   runbook entries with diagnosis steps for each).
+
+## Milestone 3 — Feast + Redis feature store
+
+### `feast materialize` used 12 GB and was OOM-killed (and had frozen WSL2 the day before)
+- **What happened**: the first Milestone 3 session ended with WSL2 frozen
+  mid-`feast materialize`. On the retry, with 13 GB free, the kernel OOM
+  killer took the `feast` process at 12.1 GB RSS instead.
+- **Root cause**: Feast's Postgres offline store materializes a window by
+  loading every row into memory and converting each into protobufs —
+  ~14 KB/row × 885k rows. `materialize-incremental` with no prior
+  materialization and a 10-year TTL means the window is the whole table.
+  The 18 unrelated containers running the day before removed the
+  headroom that would have let it fail cleanly.
+- **Fix**: chunked materialization (`ml/feature_repo/scripts/materialize.py`,
+  ≤25k rows per window, boundaries computed in SQL; measured peak
+  875 MiB) and `mem_limit` on every Feast container.
+- **Lesson**: "materialize" is a batch job with memory proportional to
+  its input; treat it like one. And cap containers — a limit turns a
+  VM-wide outage into a container exit code.
+
+### The simulator's health endpoint said `ok` on a dead service for an hour
+- **What happened**: after a broker stall the simulator's publishing
+  thread died on an uncaught exception; `/health` returned 200, Compose
+  showed `healthy`, and every downstream symptom (frozen landing tables)
+  was initially misattributed to the id-replay problem below.
+- **Root cause**: `/health` returned a constant; the producer's
+  `on_delivery_error` hook existed but was wired to `None`; a daemon
+  thread dying is silent by default.
+- **Fix**: delivery reports feed a `ProducerHealth` state; `/ready` fails
+  on current delivery errors, `/health` fails on loop death or a fatal
+  producer error; the loop survives transient publish errors. Regression:
+  `make failure-simulator-wedge`.
+- **Lesson**: a probe that cannot fail is worse than no probe — it
+  actively hides the outage. Every liveness/readiness endpoint must be
+  derived from the thing it claims to report on.
+
+### The ingestor died the same way, for a different exception
+- **What happened**: Kafka evicted the ingestor from its consumer group
+  during the stall; the next `commit()` raised `UNKNOWN_MEMBER_ID`,
+  killed the loop, and `/health` stayed 200 with ~870k lag and no group
+  members.
+- **Root cause**: as above, plus treating a *rejected commit* as fatal
+  when the design already makes redelivery safe (idempotent sink).
+- **Fix**: catch `KafkaException` on commit → log, surface via `/ready`,
+  continue (rejoin + redeliver); any other loop death → `/health` 503.
+- **Lesson**: "at-least-once + idempotent sink" means a failed commit is
+  a *retry*, not a crash. The Milestone 1 docstring even said a DB
+  failure should "stop the process" — it stopped a thread and left the
+  process (and its health check) running. Check what "stop" actually
+  does.
+
+### Restarting the simulator replayed 885k already-seen ids
+- **What happened**: after the crash-restart, the ingestor logged
+  `duplicate_events_skipped` for everything and no new curated rows
+  appeared; at 100 events/s that is ~2.5 h before any new id.
+- **Root cause**: `entity_id = f"higgs-{index}"` from `enumerate()`
+  starting at 0 on every boot.
+- **Fix**: `HIGGS_START_INDEX` (env → `Settings`), set to `max(landed)+1`
+  on restart (RUNBOOKS.md).
+- **Lesson**: a deterministic id generator is great for idempotency
+  testing and terrible for restarts unless its position is externalized.
+
+### Feast's Postgres offline store demanded SSL from a Postgres without it
+- **What happened**: first live materialize failed with `server does not
+  support SSL, but SSL was required`.
+- **Root cause**: Feast defaults `sslmode=require` for its Postgres
+  offline store.
+- **Fix**: `sslmode: disable` in `feature_store.yaml`, with a comment.
+- **Lesson**: read the defaults of every store config block; the
+  registry URL and the offline store use different client libraries with
+  different defaults.

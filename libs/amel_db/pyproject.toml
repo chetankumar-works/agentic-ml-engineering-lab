@@ -4,10 +4,14 @@ version = "0.1.0"
 description = "SQLAlchemy models, session helpers, and Alembic migrations for AMEL's PostgreSQL schemas"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "amel-common",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "psycopg[binary]>=3.2",
 ]
+
+[tool.uv.sources]
+amel-common = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

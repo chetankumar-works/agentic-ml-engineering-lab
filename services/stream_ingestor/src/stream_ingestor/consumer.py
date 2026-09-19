@@ -10,10 +10,23 @@ loop makes that safe by:
 2. Making the DB write idempotent (`INSERT ... ON CONFLICT (event_id) DO
    NOTHING`), so redelivering an already-persisted event is a no-op, not
    a duplicate row.
-3. On a DB write that keeps failing after retries, stopping the process
-   instead of silently dropping the batch or committing offsets anyway —
-   because offsets were never committed, a restart naturally redelivers
-   the same messages once the DB is healthy again.
+3. On a DB write that keeps failing after retries, stopping the consume
+   loop and failing /health (liveness) instead of silently dropping the
+   batch or committing offsets anyway — because offsets were never
+   committed, a restart naturally redelivers the same messages once the
+   DB is healthy again.
+4. On an offset commit the broker rejects (we were evicted from the
+   group during a stall — `UNKNOWN_MEMBER_ID`, `REBALANCE_IN_PROGRESS`),
+   *not* dying: the next poll rejoins and the batch is redelivered, which
+   (2) makes harmless. Before Milestone 3 this exception killed the loop
+   thread while /health kept returning 200 for an hour (RUNBOOKS.md).
+
+Probe contract (Milestone 8's Kubernetes probes point at these):
+- /health (liveness) is 503 only when the loop is dead — a restart is
+  the only way out.
+- /ready (readiness) is additionally 503 while we hold no partition
+  assignment or the last offset commit was rejected and no commit has
+  succeeded since.
 """
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ from amel_common.logging import get_logger
 from amel_common.schemas import FeatureEvent, LabelEvent
 from amel_db.models import HiggsFeatureEvent, HiggsLabelEvent
 from amel_db.session import session_scope
-from confluent_kafka import Consumer, KafkaError, Message, TopicPartition
+from confluent_kafka import Consumer, KafkaError, KafkaException, Message, TopicPartition
 from pydantic import ValidationError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -39,13 +52,18 @@ logger = get_logger(component="consumer")
 
 
 class StreamIngestor:
-    def __init__(self, settings: Settings, dlq: DlqProducer) -> None:
+    def __init__(self, settings: Settings, dlq: DlqProducer, consumer: Any = None) -> None:
         self.settings = settings
         self.dlq = dlq
-        self.ready = False
+        self.assigned = False
+        self.loop_error: str | None = None
+        self.last_commit_error: str | None = None
+        self.commit_failures = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._consumer = Consumer(
+        # `consumer` is injectable so the loop/probe logic is unit-testable
+        # without a broker (tests/test_probes.py).
+        self._consumer = consumer or Consumer(
             {
                 "bootstrap.servers": settings.kafka_bootstrap_servers,
                 "group.id": settings.consumer_group,
@@ -56,6 +74,8 @@ class StreamIngestor:
         self._consumer.subscribe(
             [settings.features_topic, settings.labels_topic],
             on_assign=self._on_assign,
+            on_revoke=self._on_revoke,
+            on_lost=self._on_revoke,
         )
 
     def _on_assign(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
@@ -63,7 +83,39 @@ class StreamIngestor:
             "consumer_partitions_assigned",
             partitions=[f"{p.topic}[{p.partition}]" for p in partitions],
         )
-        self.ready = True
+        self.assigned = True
+
+    def _on_revoke(self, _consumer: Consumer, partitions: list[TopicPartition]) -> None:
+        logger.warning(
+            "consumer_partitions_revoked",
+            partitions=[f"{p.topic}[{p.partition}]" for p in partitions],
+        )
+        self.assigned = False
+
+    # --- probes -----------------------------------------------------------
+
+    def liveness(self) -> tuple[bool, str]:
+        if self.loop_error:
+            return False, f"consume loop died: {self.loop_error}"
+        if self._thread is not None and not self._thread.is_alive() and not self._stop.is_set():
+            return False, "consume loop thread exited unexpectedly"
+        return True, "ok"
+
+    def readiness(self) -> tuple[bool, str]:
+        live, reason = self.liveness()
+        if not live:
+            return False, reason
+        if not self.assigned:
+            return False, "no partition assignment"
+        if self.last_commit_error:
+            return False, f"last offset commit rejected: {self.last_commit_error}"
+        return True, "ready"
+
+    @property
+    def ready(self) -> bool:
+        return self.readiness()[0]
+
+    # --- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="stream-ingestor-loop")
@@ -86,6 +138,9 @@ class StreamIngestor:
                 batch = self._poll_batch()
                 if batch:
                     self._process_batch(batch)
+        except Exception as exc:  # noqa: BLE001 — thread boundary: record for liveness
+            self.loop_error = repr(exc)
+            logger.critical("stream_ingestor_loop_died", error=repr(exc), exc_info=True)
         finally:
             self._consumer.close()
             logger.info("stream_ingestor_stopped")
@@ -151,7 +206,24 @@ class StreamIngestor:
             TopicPartition(topic, partition, offset + 1)
             for (topic, partition), offset in max_offset.items()
         ]
-        self._consumer.commit(offsets=offsets, asynchronous=False)
+        try:
+            self._consumer.commit(offsets=offsets, asynchronous=False)
+        except KafkaException as exc:
+            # Evicted from the group while we were writing (a broker stall,
+            # a long DB retry). Rows are already persisted and idempotent;
+            # the next poll rejoins and Kafka redelivers from the last
+            # committed offset. Not fatal — but /ready says so until a
+            # commit succeeds again.
+            self.commit_failures += 1
+            self.last_commit_error = str(exc.args[0]) if exc.args else repr(exc)
+            metrics.OFFSET_COMMIT_FAILURES.inc()
+            logger.warning(
+                "offset_commit_rejected_batch_will_be_redelivered",
+                error=self.last_commit_error,
+                rows_persisted=len(features_rows) + len(labels_rows),
+            )
+            return
+        self.last_commit_error = None
         metrics.OFFSET_COMMITS.inc()
 
     def _validate(

@@ -15,8 +15,11 @@ def main() -> None:
     logger = get_logger(component="main")
     logger.info("source_simulator_booting", kafka=settings.kafka_bootstrap_servers)
 
-    producer = KafkaEventProducer(settings.kafka_bootstrap_servers)
+    producer = KafkaEventProducer(
+        settings.kafka_bootstrap_servers, message_timeout_ms=settings.kafka_message_timeout_ms
+    )
     runner = SimulatorRunner(settings, producer)
+    producer.on_delivery = runner.record_delivery  # delivery reports -> probes
     app = create_app(runner)
 
     uvicorn.run(app, host="0.0.0.0", port=settings.http_port, log_config=None)  # noqa: S104

@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -36,3 +36,16 @@ seed:
 
 smoke:
 	uv run python scripts/smoke_milestone1.py
+
+# --- Feature store (Milestone 3: Feast + Redis) ---
+
+feast-materialize:   # chunked backfill of curated -> Redis; resumes from the registry
+	$(COMPOSE) --profile feast-demo run --rm --build feast-materialize
+
+feast-demo:          # historical (point-in-time) + online retrieval acceptance demo
+	$(COMPOSE) --profile feast-demo run --rm --build feast-demo
+
+# --- Failure engineering (regression scripts for real incidents, see RUNBOOKS.md) ---
+
+failure-simulator-wedge:   # pauses the Kafka broker; simulator probes must go 503 and recover
+	uv run python scripts/failure_engineering/simulator_producer_wedge.py

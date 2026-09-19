@@ -12,6 +12,15 @@ DELIVERY_ERRORS = Counter(
     "Kafka delivery errors reported by the producer",
     ["topic"],
 )
+EVENTS_DROPPED = Counter(
+    "amel_simulator_events_dropped_total",
+    "Events the simulator could not hand to the producer (local queue full / fatal producer)",
+    ["event_type"],
+)
+READY = Gauge(
+    "amel_simulator_ready",
+    "1 if /ready would return 200 right now, else 0",
+)
 PAUSED = Gauge(
     "amel_simulator_paused",
     "1 if the simulator is currently paused, else 0",

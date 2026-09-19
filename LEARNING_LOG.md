@@ -490,3 +490,204 @@ this project's Definition of Done, not just "unit tests pass"):
   with curated table size — this pipeline chose correctness and flagged
   the growing-scan cost as a known, documented limitation rather than
   solving incremental materialization here.)
+
+## Milestone 3 — Feast + Redis feature store
+
+**WHAT WAS BUILT.** A Feast 0.66 feature repository (`ml/feature_repo`:
+one `entity_id` entity, one `higgs_features` feature view with the 28
+HIGGS float fields, `tags={"version": "1"}`) whose offline source is
+`curated.higgs_features_flat` — a Postgres VIEW (Alembic `0003`) that
+flattens the JSONB `features` column into typed columns — and whose
+online store is Redis 7. Feast's registry is a SQL registry in a new
+`feast` database on the existing Postgres. Three one-shot Compose
+services (`feast-apply`, `feast-materialize`, `feast-demo`) and one
+always-on `feast-server` (`feast serve`, 1 GB cap). Chunked
+materialization (`scripts/materialize.py`) replaces the Feast CLI.
+The DAG's `update_feature_store` stub is now real: it finds the rows the
+current run inserted (by `source_run_id`), splits them into ≤25k-row
+windows, and `POST`s each to `feast-server /materialize`. Along the way
+the simulator and ingestor got honest liveness/readiness probes, a
+`HIGGS_START_INDEX`, and a failure-engineering script that reproduces
+the producer wedge. ADR-0005 records the decisions.
+
+**WHY IT EXISTS — what a feature store solves.**
+- *Point-in-time correctness.* A training row is "entity E, at time T,
+  had label Y" — the features must be the values that were true *at T*,
+  not the latest ones. Feast's `get_historical_features(entity_df,
+  features)` performs that as-of join for you: for each (entity,
+  timestamp) in the entity dataframe it finds the newest feature row
+  with `event_timestamp <= T` (within TTL). The demo proves both
+  directions: label timestamps (10 s after the feature event) get all 28
+  features; the *same entities as-of one day earlier* get nothing
+  (0/20 rows with any feature) — a naive "latest value per entity" join
+  would have leaked the future into training.
+- *Train/serve skew prevention.* Training reads offline (Postgres),
+  inference reads online (Redis), but both go through the **same
+  feature definitions** — same names, same types, same source — so the
+  number a model was trained on is the number it will be served.
+  The demo asserts this directly: `lepton_pt` from Redis == `lepton_pt`
+  from Postgres for the same entities (5/5), and after the DAG run the
+  newest curated entity (`higgs-000938837`) returns identical values
+  from `feast-server /get-online-features` and from the flat view.
+- *Online/offline consistency as a managed process.* "Materialize" is
+  the explicit, recorded act of copying the latest feature values into
+  the online store. Feast records every materialized interval in the
+  registry, so "what is in Redis" is a fact you can query, not a hope.
+  An entity that landed *after* the last run is (correctly) absent
+  online — the demo checks that too.
+- *One catalogue.* Feature definitions live in code (`definitions.py`),
+  are applied to a registry, and carry a version tag; a training run
+  (Milestone 4) can record exactly which definition it used, and the
+  registry's `feature_view_version_history` table shows every change.
+
+**WHAT A FEATURE STORE DOES *NOT* SOLVE.**
+- It does not make your data correct. Feast joins on whatever
+  `event_timestamp` you give it; if timestamps are assigned at publish
+  time (as this simulator does) rather than at the physical event, the
+  as-of join is exactly as meaningful as those timestamps. It does not
+  deduplicate, validate, or backfill — Milestones 1–2 do that upstream.
+- It does not solve freshness. Redis is only as fresh as the last
+  materialization; here that is "up to the last 5-minute DAG run". A
+  real-time feature needs a streaming push path (Feast's `push`
+  sources), which is a different architecture.
+- It does not solve memory or scale by itself. Feast's Postgres
+  offline store materialization loads a whole window into memory
+  (~14 KB/row observed → 12 GB over 885k rows). The chunking is ours,
+  not Feast's.
+- It is not a model registry, not a metadata graph, not lineage. It
+  knows "feature view v1 was materialized for [t0, t1)"; it does not
+  know which model consumed it — that is MLflow's job (Milestone 4/5).
+- It does not remove the need for the *same transformation code* on
+  both paths when features are derived: our features are raw columns,
+  so this milestone side-steps it; a derived feature (say, a rolling
+  mean) would need an on-demand feature view or a shared transform
+  library to keep both paths identical.
+
+**HOW DATA/CONTROL FLOWS THROUGH IT.**
+1. `feast-apply` (one-shot, after `migrate`) registers the entity, the
+   Postgres source, and the feature view in the `feast` DB registry.
+2. Backfill: `make feast-materialize` → `scripts/materialize.py` reads
+   the registry's last materialized end (or the source's `min(
+   event_timestamp)` on first run), computes every 25,000th
+   `event_timestamp` in SQL as window boundaries, and calls
+   `store.materialize(lo, hi)` per window. Each window: one SQL
+   `SELECT ... WHERE event_timestamp BETWEEN lo AND hi` (latest row per
+   entity), rows → protobufs → Redis `HSET` per entity.
+3. Steady state: every DAG run's `update_feature_store` task selects
+   `min/max(event_timestamp)` and the row-count boundaries for
+   `curated.higgs_features WHERE source_run_id = <this run>`, then
+   `POST http://feast-server:6566/materialize {start_ts, end_ts,
+   feature_views:["higgs_features"]}` per window (synchronous; the task
+   fails loudly on any HTTP error so Airflow retries). Zero inserted rows
+   → no HTTP call, `nothing_to_materialize`.
+4. Training path (Milestone 4 will use it): build an entity dataframe
+   from `curated.higgs_labels` (`entity_id`, `label_timestamp` as
+   `event_timestamp`, `target`) → `store.get_historical_features(...)`.
+5. Inference path: `store.get_online_features(features, entity_rows)`
+   from Python, or `POST feast-server /get-online-features` over HTTP —
+   what `apps/inference_api` (Milestone 5) will call.
+
+**THE INCIDENT, AND WHAT IT TAUGHT.** The first attempt at this
+milestone froze WSL2 mid-materialize. On the retry it turned out to be a
+chain of four distinct failures, each masked by the previous one:
+1. `feast materialize` reached 12.1 GB RSS and was OOM-killed (the day
+   before, the same thing froze the VM). Fix: chunking + container
+   memory caps.
+2. While Kafka was starved by (1), the simulator's producer timed out
+   every message and its loop thread died — with `/health` returning
+   200. Fix: delivery reports → `ProducerHealth` → `/ready` and
+   `/health` derived from real state; the loop survives transient
+   errors. Regression: `make failure-simulator-wedge`.
+3. Kafka also evicted the ingestor from its consumer group; the next
+   `commit()` raised and killed *its* loop — also with `/health` at
+   200, ~870k lag, zero group members. Fix: a rejected commit is a
+   redelivery, not a crash; loop death fails liveness.
+4. Once (2) and (3) were fixed, restarting the simulator replayed
+   885k already-landed ids. Fix: `HIGGS_START_INDEX`.
+Only after all four did new data flow end-to-end into Redis. The lesson
+that generalizes: **a health endpoint that cannot fail hides every
+other failure**, and Milestone 8's Kubernetes probes would have
+inherited the lie.
+
+**IMPORTANT CODE FILES.**
+- `ml/feature_repo/definitions.py` — the entity, source, feature view,
+  version tag, and the TTL comment.
+- `ml/feature_repo/feature_store.yaml` — registry/offline/online config
+  and the `sslmode` note.
+- `ml/feature_repo/scripts/materialize.py` — chunked backfill; read
+  `_chunk_boundaries` and `plan` for the resume logic.
+- `ml/feature_repo/scripts/demo_retrieval.py` — the acceptance demo:
+  historical (positive + negative as-of), online, consistency.
+- `infra/airflow/dags/higgs_pipeline_tasks.py` —
+  `materialize_windows_for_run` / `update_feature_store`.
+- `libs/amel_db/alembic/versions/0003_curated_higgs_features_flat_view.py`.
+- `services/source_simulator/src/source_simulator/simulator.py` —
+  `ProducerHealth`, `liveness()`, `readiness()`, `_on_publish_error`.
+- `services/stream_ingestor/src/stream_ingestor/consumer.py` — the
+  probe contract in the module docstring and the commit `except`.
+- `scripts/failure_engineering/simulator_producer_wedge.py`.
+- `DECISIONS.md` ADR-0005; `RUNBOOKS.md` (five new entries).
+
+**FAILURE MODES (exercised, not hypothetical).**
+- Unbounded materialization → OOM (12.1 GB) → fixed by chunking, peak
+  875 MiB, containers capped.
+- Broker paused for 30+ s → simulator `/ready` 503 in 32 s with the
+  Kafka error, 294 delivery failures counted, self-recovery in 0 s
+  after unpause, `/health` correctly stays 200 (transient, not fatal).
+- Consumer-group eviction → commit rejected → loop continues, rejoins,
+  redelivers; idempotent sink absorbs it.
+- DAG run with zero new rows → `nothing_to_materialize`, no HTTP call.
+- Entity requested online before it is curated → `None`, not a stale
+  or fabricated value.
+
+**HOW TO TEST IT.**
+- Unit (`make test`, 69 tests, no infra): feature-view schema/version,
+  window splitting (both the backfill script and the Airflow task), the
+  task's one-POST-per-window/skip/propagate-error behaviour, both
+  services' probe state machines, `HIGGS_START_INDEX` offsetting.
+- Integration: `make up` → `make feast-materialize` → `make feast-demo`
+  (prints and asserts the four properties above). Then trigger
+  `higgs_pipeline` and read `update_feature_store_done` in the task log;
+  `redis-cli DBSIZE` must equal `count(*)` of `curated.higgs_features`.
+- Failure engineering: `make failure-simulator-wedge` (pauses Kafka for
+  ~30 s; the stack keeps running).
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- As-of (point-in-time) joins and why "latest value" joins leak the
+  future; TTL as the bound on how stale an as-of match may be.
+- Offline vs online stores as *different access patterns over the same
+  definitions* (columnar/bulk/historical vs key-value/latest/low
+  latency), and materialization as the bridge.
+- Train/serve skew: where it comes from (different code paths,
+  different data, different timing) and which part a feature store
+  removes (definition and data) versus not (derived-feature code).
+- Liveness vs readiness: "restart me" vs "don't send me work"; why each
+  must be computed from real state; why a rejected Kafka commit is a
+  readiness event and a dead loop is a liveness event.
+- Idempotent producers (librdkafka `enable.idempotence`), message
+  timeouts, and what a fatal producer error means.
+- Memory as a first-class constraint: batch jobs with memory
+  proportional to input must be chunked, and containers must be capped
+  so failures stay local.
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "What does a feature store give you that a well-indexed feature table
+  doesn't?" (as-of joins, one definition for both paths, recorded
+  materialization, versioned catalogue — and what it still leaves to
+  you.)
+- "How do you prove a training set has no label leakage from features?"
+  (Request features as-of a time before they existed; expect nulls.)
+- "Your Kubernetes pod is Running and Ready but doing no work. What
+  went wrong with its probes, and how do you design probes that can't
+  do that?"
+- "A Kafka consumer's offset commit fails with `UNKNOWN_MEMBER_ID` —
+  should it crash?" (No: with an idempotent sink it should rejoin and
+  accept redelivery; it should *report* degraded readiness.)
+- "A batch job OOMs on production data but not in dev. Walk me through
+  bounding its memory without changing its output." (Chunk by row count
+  computed from the data, resume from recorded progress, cap the
+  container.)
+- "Why put a feature server between the orchestrator and the online
+  store instead of importing the SDK in the DAG?" (Dependency isolation,
+  a real service boundary, memory containment, and it mirrors production
+  topology.)

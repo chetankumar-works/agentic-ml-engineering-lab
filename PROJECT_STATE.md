@@ -7,169 +7,176 @@ clean stopping point mid-milestone) per the Definition of Done in
 
 ## Current milestone
 
-**Milestone 2 — Airflow + MinIO + bronze/silver/gold batch pipeline.** Complete.
+**Milestone 3 — Feast + Redis feature store.** Complete.
 
-## Completed work
+## Completed work (Milestone 3; Milestones 0–2 summarized in MILESTONE_REPORT.md)
 
-- **`libs/amel_lake`** (new uv workspace member): MinIO/S3 client
-  (`object_store.py`), deterministic bronze/silver/gold/validation-report
-  object keys (`keys.py`), Pandera-based validation with a
-  quarantine-invalid-rows pattern (`validation.py`), watermark read/
-  monotonic-advance (`watermark.py`).
-- **PostgreSQL**: `curated.higgs_features`, `curated.higgs_labels`,
-  `curated.training_records`, `control.pipeline_watermarks`,
-  `control.pipeline_runs` (Alembic `0002_curated_and_control_pipeline_tables`,
-  which also indexes `landing.*.ingested_at` for the watermark queries).
-- **MinIO**: `bronze`/`silver`/`gold`/`pipeline`/`mlflow` buckets,
-  provisioned by a one-shot `minio-init` container
-  (`infra/minio/create_buckets.sh`, idempotent).
-- **Airflow 3.3.2** (`infra/airflow/Dockerfile`, its own image outside
-  the uv workspace — see `DECISIONS.md` ADR-0004), running
-  `airflow standalone` with `LocalExecutor`, its metadata DB as a second
-  database (`airflow`) on the same Postgres instance. DAG `higgs_pipeline`
-  (`infra/airflow/dags/`): `determine_high_watermark → extract_new_records
-  → write_bronze → validate → transform → write_silver →
-  update_curated_tables → build_training_dataset → update_feature_store
-  (stub — Feast is Milestone 3) → emit_pipeline_metadata`, with retries,
-  a 10-minute per-task timeout, and a DAG-level `on_failure_callback`
-  that writes a `control.pipeline_runs` failure row.
-- Business logic (`higgs_pipeline_tasks.py`) is Airflow-independent and
-  unit-tested in the ordinary uv workspace venv; `higgs_pipeline.py` is
-  the thin Airflow wrapper (`@task`, XCom, context, retries).
-- **Idempotency**: bronze/silver/gold objects keyed by `run_id`
-  (re-running overwrites, never duplicates); curated upserts are
-  `ON CONFLICT DO NOTHING`; the watermark only advances in the same
-  transaction as the curated upsert it gates, and only ever *forward*
-  (`GREATEST`, see the bug below).
-- **Three real bugs found and fixed during the acceptance run** (full
-  writeup in `LEARNING_LOG.md`'s Milestone 2 entry, runbook entries in
-  `RUNBOOKS.md`):
-  1. `KeyError: 'data_interval_end'` on manually-triggered DAG runs (no
-     data interval exists for those) — fixed with an `_upper_bound()`
-     fallback to `dag_run.run_after`.
-  2. `psycopg.OperationalError: ... between 0 and 65535` — a bulk upsert
-     of one row per extracted record blew Postgres's bind-parameter cap
-     at real backlog scale — fixed by chunking every upsert at 2,000 rows.
-  3. The watermark could silently *regress* under concurrent/out-of-order
-     DAG run retries (unconditional overwrite) — fixed with
-     `SET watermark = GREATEST(current, new)`; verified the fix advances
-     correctly and that the resulting wide re-extraction window produced
-     zero duplicate curated rows (idempotency absorbed the metadata bug
-     cleanly).
-- 44 → 45 unit tests (up from Milestone 1's 24): dataset/validation/
-  watermark/key-building logic in `amel_lake`, DAG task logic in
-  `higgs_pipeline_tasks.py` — none require live infra.
+- **`ml/feature_repo`** (new uv workspace member `amel-feature-repo`,
+  `[tool.uv.workspace] members` now includes `ml/*`): Feast 0.66
+  `definitions.py` (entity `entity_id`; feature view `higgs_features`
+  with the 28 HIGGS `Float32` fields, `tags={"version": "1"}`, 10-year
+  TTL — see the comment for why), `feature_store.yaml` (SQL registry in a
+  new `feast` Postgres DB, Postgres offline store with `sslmode:
+  disable`, Redis online store), `scripts/materialize.py` (chunked,
+  resumable backfill), `scripts/demo_retrieval.py` (acceptance demo),
+  tests. `DECISIONS.md` ADR-0005 records the offline-store choice.
+- **PostgreSQL**: Alembic `0003` adds VIEW `curated.higgs_features_flat`
+  (28 typed `float8` columns generated from `HIGGS_FEATURE_NAMES` over
+  the JSONB `features` column); `infra/postgres/init/02-create-feast-db.sql`
+  creates the `feast` database.
+- **Redis 7** (`redis:7-alpine`, host port 6380, `redis-data` volume) as
+  the online store.
+- **Compose services**: `feast-apply` (one-shot, default set),
+  `feast-server` (always-on `feast serve`, `mem_limit: 1g`,
+  host port 6566, healthchecked — ADR-0005 explains why always-on),
+  `feast-materialize` and `feast-demo` behind `--profile feast-demo`
+  (`make feast-materialize`, `make feast-demo`). All Feast containers
+  memory-capped after an unbounded materialize hit 12.1 GB.
+- **`update_feature_store` is real**: `higgs_pipeline_tasks.py`
+  selects this run's inserted rows by `source_run_id`, splits them into
+  ≤25,000-row windows (boundaries computed in SQL), and `POST`s each to
+  `feast-server /materialize`; zero rows → no call. Airflow reaches it
+  via `FEAST_SERVER_URL`. Feast is *not* installed in the Airflow image.
+- **Honest probes** (found necessary mid-milestone, see the incident in
+  `LEARNING_LOG.md`): `source_simulator` and `stream_ingestor` now derive
+  `/health` (liveness) and `/ready` (readiness) from real producer/
+  consumer state and expose it in `/status`; the simulator's loop
+  survives transient publish errors; the ingestor treats a rejected
+  offset commit as a redelivery, not a crash.
+  `KAFKA_MESSAGE_TIMEOUT_MS` (default 30 s) and `HIGGS_START_INDEX`
+  added to the simulator.
+- **Failure engineering**: `scripts/failure_engineering/
+  simulator_producer_wedge.py` (`make failure-simulator-wedge`) pauses
+  the broker and asserts the probe transitions and recovery.
+- 45 → **69 unit tests**, none requiring infra.
 
-## Milestone 2 acceptance run
+## Milestone 3 acceptance run
 
-Run 2026-09-18 against the live, continuously-growing landing tables
-(source_simulator + stream_ingestor running throughout) via `make up`
-plus manually triggering `higgs_pipeline` (`airflow dags trigger
-higgs_pipeline`) both as ad-hoc runs and via its `*/5 * * * *` schedule.
-
-**10 DAG runs, all `status='success'`** in `control.pipeline_runs` by
-the end of the session (including runs that initially hit the three bugs
-above and succeeded on retry after each fix shipped, and one run that
-legitimately processed a zero-row window with no errors).
-
-Final state when the stack was brought down for this commit:
+Run 2026-09-19 against the live stack after a clean `make down` /
+Redis-volume wipe / `make up` (the previous session had been lost to a
+WSL2 freeze mid-materialize; nothing from it was trusted).
 
 ```
-curated.higgs_features:   884,910 rows, 884,910 distinct event_id
-curated.higgs_labels:     880,628 rows, 880,628 distinct event_id
-curated.training_records: 878,903 rows, 878,903 distinct entity_id
-control.pipeline_watermarks: higgs_features / higgs_labels both at
-  2026-09-18 20:28:16.599563, advancing monotonically across every run
-control.pipeline_runs: 10/10 status='success'
-MinIO: bronze/silver objects for every run (higgs/{features,labels}/
-  dt=.../run_id=....parquet), gold/training/run_id=....parquet for runs
-  that added new training records, pipeline/artifacts/validation_reports/
-  run_id=....json for every run
+Backfill (make feast-materialize, after redis-cli FLUSHALL → DBSIZE 0):
+  36 windows, 167 s, peak container memory 875 MiB (docker stats)
+  Redis DBSIZE 884,910 == count(*) curated.higgs_features
+  (the unchunked `feast materialize-incremental` before it: OOM-killed at 12.1 GB RSS)
+
+Demo (make feast-demo):
+  feature view: higgs_features version=1 features=28
+  historical retrieval: 20 rows, 0 with any missing feature
+  as-of one day earlier: 20 rows, 0 with leaked (future) features
+  online retrieval: 5 entities requested, 5 returned a value
+  online == offline for lepton_pt: 5/5
+  Milestone 3 demo PASSED
+
+DAG end-to-end (manual__2026-09-19T20:21:09 after new ids started landing):
+  update_feature_store_task success — status=materialized windows=3
+  rows this run inserted: 51,880 (higgs-000886643 .. higgs-000938837)
+  Redis DBSIZE 936,790 == curated count 936,790
+  feast-server /get-online-features higgs-000938837:
+    lepton_pt 1.029426097869873, m_bb 0.6682522296905518  == Postgres flat view
+  entity landed after the run (higgs-000944187): online value None (correctly absent)
+  control.pipeline_runs: 31/31 success (13 at session start)
+
+Failure engineering (make failure-simulator-wedge):
+  /ready -> 503 after 32 s: "kafka delivery failing: ... Local: Message timed out"
+  /health 200 (transient, not fatal — correct); delivery_failures 0 -> 294
+  after unpause: /ready 200 in 0 s, rows_read advancing; PASSED
+
+Steady-state memory with everything up: ~5–6 GB of 15 GB
+  (feast-server 165 MiB idle / 361 MiB after materialize calls; Redis 495 MB)
 ```
 
-**All Milestone 2 acceptance criteria verified against real, live data**:
-the scheduled DAG processes newly-arrived `landing` data idempotently
-into `curated` via MinIO bronze/silver/gold Parquet — including under
-adverse conditions (concurrent retries, a stale/regressed watermark
-forcing a wide re-extraction) that came up organically during the run,
-not from a contrived test.
+**All Milestone 3 acceptance criteria verified**: historical
+(point-in-time-correct, with a negative leakage check) retrieval and
+online materialization + retrieval both work as separate code paths on
+real curated data, the scheduled DAG materializes each run's new rows,
+and online values equal offline values.
 
 ## Verified tool versions (WSL2, Ubuntu 26.04 LTS "resolute")
 
-Unchanged from Milestone 0/1 (re-verify at the start of Milestone 3) —
+Unchanged from Milestone 0/1/2 (re-verify at the start of Milestone 4) —
 see git history for the full table. Additions this milestone:
-`apache/airflow:3.3.2-python3.12`, `quay.io/minio/minio:latest`,
-`quay.io/minio/mc:latest` (MinIO moved off Docker Hub to Quay —
-`minio/minio`/`minio/mc` no longer resolve there).
+`redis:7-alpine` (7.4.11), `feast[postgres,redis]==0.66.0` (in the uv
+workspace — it resolved cleanly, unlike Airflow), `mermaid-cli`/`mermaid@11`
+used only to parse-check the ARCHITECTURE.md diagrams.
 
 ## Current known failures / gaps
 
-- `build_training_dataset` joins the *full* `curated.higgs_features`/
-  `curated.higgs_labels` against `curated.training_records` (LEFT JOIN
-  WHERE NULL) every single run — correct, but the scan grows with
-  curated table size (observed ~50s at ~550k curated rows). Documented
-  as a known limitation in the task's own docstring; revisit with
-  incremental materialization if/when this becomes the pipeline's
-  bottleneck, not before.
-- `source_simulator.ensure_dataset()` still has no download retry/
-  hardening (carried over from Milestone 1's known gaps) — not touched
-  this milestone.
-- No deliberate MinIO-down or Airflow-scheduler-down chaos exercise yet
-  — good candidate for the Milestone 7+ Failure Engineering pass.
+- `build_training_dataset` full-join scan (carried from Milestone 2;
+  ~50 s at ~550k curated rows) — unchanged.
+- `source_simulator.ensure_dataset()` download hardening (carried from
+  Milestone 1) — unchanged.
+- The simulator does not persist its own position: after a restart,
+  `HIGGS_START_INDEX` must be set by hand to `max(landed)+1`
+  (RUNBOOKS.md) or it replays already-seen ids. Fine for Compose; a
+  Kubernetes deployment (Milestone 8) should externalize this.
+- Per-run materialization in the DAG is synchronous; a window
+  approaching the 10-minute task timeout would need
+  `POST /materialize?async=true` + polling (ADR-0005 trigger).
+- `curated.higgs_features_flat` is a plain VIEW — JSON extraction is
+  recomputed on every offline read. Promote to a materialized view or a
+  flat table if historical retrieval becomes slow.
+- Feast's Postgres offline store materialization is ~14 KB/row of
+  memory; the 25k-row chunk (~875 MiB peak) is tuned for this machine.
+- The stream_ingestor's health regression is covered by unit tests but
+  has no live failure-engineering script yet (the simulator's does
+  double duty: pausing Kafka also exercises the ingestor's rejoin path,
+  observed manually). Candidate for the Milestone 7+ failure pass.
 - No CI workflow yet (Milestone 7).
 
 ## Commands that work today
 
 ```bash
 make install       # uv sync --all-packages
-make lint / fmt / typecheck / test   # all pass, no infra required
+make lint / fmt / typecheck / test   # all pass, no infra required (69 tests)
 
-make up             # postgres, kafka, minio, airflow, kafka-init, minio-init,
-                     # migrate, source-simulator, stream-ingestor
+make up             # postgres, kafka, minio, redis, airflow, feast-server + one-shots
 make logs
-make smoke          # Milestone 1 check (100k+ events, dedup, DLQ)
+make smoke          # Milestone 1 check
+make feast-materialize   # Milestone 3 backfill (chunked, resumable)
+make feast-demo          # Milestone 3 acceptance demo
+make failure-simulator-wedge   # pauses Kafka ~30 s, checks probes, recovers
 make down
 
-# Airflow (Milestone 2):
+# Feast (Milestone 3):
+curl -s localhost:6566/health
+curl -s -X POST localhost:6566/get-online-features -H 'Content-Type: application/json' \
+  -d '{"features":["higgs_features:lepton_pt"],"entities":{"entity_id":["higgs-000000001"]}}'
+docker exec amel-redis-1 redis-cli DBSIZE      # must equal count(*) of curated.higgs_features
+docker exec amel-postgres-1 psql -U amel -d feast -c "SELECT feature_view_name FROM feature_views;"
+
+# Probes (Milestone 3 fix):
+curl -s localhost:8001/status | python3 -m json.tool   # simulator: live/ready/producer_health
+curl -s localhost:8002/status                          # ingestor
+
+# Restarting the simulator without replaying ids:
+MAXID=$(docker exec amel-postgres-1 psql -U amel -d amel -tAc "SELECT max(entity_id) FROM landing.higgs_feature_events")
+HIGGS_START_INDEX=$(( 10#${MAXID#higgs-} + 1 )) docker compose -f infra/docker-compose.yml up -d --no-deps source-simulator
+
+# Airflow (Milestone 2), unchanged:
 docker exec amel-airflow-1 airflow dags trigger higgs_pipeline
 docker exec amel-airflow-1 airflow tasks states-for-dag-run higgs_pipeline <run_id>
-docker exec amel-airflow-1 airflow dags list-import-errors
-# UI: http://localhost:8080 (SimpleAuthManager; admin password printed to
-# the airflow container's logs on first boot)
-
-# manual verification used during this milestone:
-docker exec amel-postgres-1 psql -U amel -d amel -c \
-  "SELECT count(*), count(DISTINCT event_id) FROM curated.higgs_features;"
-docker exec amel-postgres-1 psql -U amel -d amel -c \
-  "SELECT * FROM control.pipeline_watermarks;"
-docker run --rm --network amel_default --entrypoint sh quay.io/minio/mc:latest -c \
-  "mc alias set local http://minio:9000 amel amel_dev_password && mc ls -r local/bronze"
 ```
 
 ## Next task
 
-**Milestone 3 — Feast + Redis.**
+**Milestone 4 — Training + MLflow.**
 
-Acceptance: historical features can be retrieved and online
-materialization demonstrated.
+Acceptance (AMEL_KICKOFF_PROMPT.md "Training" and "MLflow" sections): a
+reproducible training package (`ml/training`) using
+`DecisionTreeClassifier` that retrieves features through Feast's
+*offline* path, with configuration, seeded train/validation/test split,
+metrics, confusion matrix, feature importances, model signature, dataset
+version, Git SHA, and the feature view version (`higgs_features` v1)
+recorded; an MLflow tracking server (Postgres backend, MinIO `mlflow`
+bucket for artifacts) logging all of it; registration under
+`higgs_decision_tree` with `candidate`/`champion` aliases and explicit
+promotion criteria. No notebook required for production training.
 
-Concretely, in order (see `AMEL_KICKOFF_PROMPT.md`'s Feature Store
-section for full detail):
-1. Add Redis to `infra/docker-compose.yml` as the online store.
-2. Build `ml/feature_repo` — Feast entity/feature-view definitions over
-   `curated.higgs_features`/`curated.higgs_labels` (Postgres) or the
-   `silver`/`gold` Parquet in MinIO as the offline source (decide which
-   and record the reasoning in `DECISIONS.md` — Feast's Postgres offline
-   store vs. a file/Parquet offline store have different tradeoffs worth
-   being explicit about).
-3. Demonstrate historical (point-in-time-correct) feature retrieval for
-   training, and online feature materialization + retrieval for
-   inference, as two clearly separate, working code paths.
-4. Replace `update_feature_store`'s no-op stub in `higgs_pipeline.py`
-   with a real Feast materialization call, now that there's a feature
-   store to materialize into.
-5. Document what a feature store solves (point-in-time correctness,
-   train/serve skew prevention, online/offline consistency) and what it
-   does *not* solve, in `LEARNING_LOG.md`.
-6. Full Definition of Done pass, commit `feat(milestone-3): ...`, push,
-   tag `milestone-3`.
+Before starting: `make up`, confirm `feast-server` healthy and Redis
+`DBSIZE` == curated count, re-verify tool versions. Memory budget: the
+MLflow server is one more always-on container (~300 MB); training on
+~900k rows × 28 floats is ~200 MB in pandas — fine, but cap the
+container.

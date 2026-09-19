@@ -1,0 +1,38 @@
+# Feast feature store config. Hostnames (`postgres`, `redis`) are the
+# Docker Compose service names — this file is meant to run inside the
+# `feast-apply`/`feast-materialize`/`feast-demo` containers, matching how
+# every other infra config file in this repo (kafka topic creation,
+# Postgres init scripts) is written for the Docker network, not the host.
+project: amel
+provider: local
+
+# Own database on the shared Postgres instance, same pattern as Airflow's
+# metadata DB — see DECISIONS.md ADR-0004 and infra/postgres/init/02-create-feast-db.sql.
+registry:
+  registry_type: sql
+  path: postgresql+psycopg://amel:amel_dev_password@postgres:5432/feast
+
+# Historical (point-in-time) feature retrieval reads from here — see
+# libs/amel_db migration 0003 for the curated.higgs_features_flat view
+# this points at.
+offline_store:
+  type: postgres
+  host: postgres
+  port: 5432
+  database: amel
+  db_schema: curated
+  user: amel
+  password: amel_dev_password
+  # Feast's Postgres offline store defaults sslmode to "require"; this
+  # local Postgres container has no SSL configured at all — without this,
+  # every offline query fails with "server does not support SSL, but SSL
+  # was required" (found running feast-materialize against the real stack).
+  sslmode: disable
+
+# Online (low-latency, latest-value) feature retrieval reads from here
+# after `feast materialize`/`materialize_incremental` has run.
+online_store:
+  type: redis
+  connection_string: redis:6379
+
+entity_key_serialization_version: 3

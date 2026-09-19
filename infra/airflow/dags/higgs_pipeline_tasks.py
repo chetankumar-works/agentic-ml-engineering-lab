@@ -13,8 +13,11 @@ idempotency argument this module implements.
 
 from __future__ import annotations
 
+import json
+import urllib.request
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 from amel_common.schemas import HIGGS_FEATURE_NAMES
@@ -28,7 +31,7 @@ from amel_db.models import (
 from amel_db.session import session_scope
 from amel_lake.validation import ValidationReport, features_schema, labels_schema, validate
 from amel_lake.watermark import advance_watermark, get_watermark
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -48,6 +51,7 @@ UPSERT_BATCH_SIZE = 2000
 
 def _chunked(rows: list[dict], size: int) -> list[list[dict]]:
     return [rows[i : i + size] for i in range(0, len(rows), size)]
+
 
 FEATURE_COLUMNS = [
     "event_id",
@@ -270,3 +274,116 @@ def upsert_training_records(df: pd.DataFrame) -> int:
             )
             total_inserted += len(session.execute(stmt).fetchall())
     return total_inserted
+
+
+# --- Feature store (Milestone 3) ---------------------------------------
+#
+# Materialization is delegated over HTTP to the long-running
+# `feast-server` container (`feast serve`, see infra/docker-compose.yml
+# and DECISIONS.md ADR-0005) rather than importing Feast here: the Airflow
+# image deliberately does not carry Feast's dependency tree, and calling
+# a feature-store *service* is how the orchestrator/feature-store boundary
+# looks in production anyway.
+#
+# The window materialized is exactly the rows this run inserted into
+# `curated.higgs_features` (they carry `source_run_id`), split into
+# `chunk_rows`-sized windows: Feast's Postgres offline store loads a whole
+# window into memory (~14 KB/row observed), so peak memory must be bounded
+# by chunk size, not by how much data a run happened to process. Same
+# reasoning as ml/feature_repo/scripts/materialize.py, which owns the
+# initial backfill.
+
+FEATURE_VIEW_NAME = "higgs_features"
+MATERIALIZE_CHUNK_ROWS = 25_000
+# Feast's /materialize rejects start_ts >= end_ts, and its offline query
+# is `BETWEEN` (inclusive), so the final window is padded past max().
+_WINDOW_END_PAD = timedelta(microseconds=1)
+
+
+def materialize_windows(
+    start: datetime, end: datetime, boundaries: Sequence[datetime]
+) -> list[tuple[datetime, datetime]]:
+    """Split [start, end] at each interior boundary, dropping empty windows."""
+    edges = [start, *[b for b in boundaries if start < b < end], end]
+    return [(lo, hi) for lo, hi in zip(edges, edges[1:], strict=False) if lo < hi]
+
+
+def materialize_windows_for_run(
+    run_id: str, chunk_rows: int = MATERIALIZE_CHUNK_ROWS
+) -> list[tuple[datetime, datetime]]:
+    """Time windows covering every `curated.higgs_features` row this run
+    inserted, each holding at most ~`chunk_rows` rows. Empty when the run
+    inserted nothing (a zero-row window, or a re-run whose upserts were
+    all `ON CONFLICT DO NOTHING`)."""
+    with session_scope() as session:
+        lo, hi, n = session.execute(
+            select(
+                func.min(CuratedHiggsFeature.event_timestamp),
+                func.max(CuratedHiggsFeature.event_timestamp),
+                func.count(),
+            ).where(CuratedHiggsFeature.source_run_id == run_id)
+        ).one()
+        if not n:
+            return []
+        boundaries = [
+            row[0]
+            for row in session.execute(
+                text(
+                    """
+                    SELECT ts FROM (
+                        SELECT event_timestamp AS ts,
+                               row_number() OVER (ORDER BY event_timestamp) AS rn
+                        FROM curated.higgs_features
+                        WHERE source_run_id = :run_id
+                    ) numbered
+                    WHERE rn % :chunk_rows = 0
+                    ORDER BY ts
+                    """
+                ),
+                {"run_id": run_id, "chunk_rows": chunk_rows},
+            )
+        ]
+    return materialize_windows(lo, hi + _WINDOW_END_PAD, boundaries)
+
+
+def _post_json(url: str, payload: dict, timeout_seconds: float) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310 — fixed internal URL
+        body = response.read()
+    return json.loads(body) if body else {}
+
+
+def update_feature_store(
+    run_id: str,
+    feast_server_url: str,
+    *,
+    chunk_rows: int = MATERIALIZE_CHUNK_ROWS,
+    timeout_seconds: float = 300.0,
+    post: Callable[[str, dict, float], dict] = _post_json,
+) -> dict[str, int | str]:
+    """Materialize this run's newly curated features into the online store
+    via the feature server's synchronous `POST /materialize`. Idempotent:
+    re-materializing a window rewrites the same latest-value-per-entity.
+    Raises on any HTTP failure so Airflow retries/fails the task rather
+    than silently leaving the online store stale."""
+    windows = materialize_windows_for_run(run_id, chunk_rows)
+    for lo, hi in windows:
+        post(
+            f"{feast_server_url.rstrip('/')}/materialize",
+            {
+                "start_ts": lo.isoformat(),
+                "end_ts": hi.isoformat(),
+                "feature_views": [FEATURE_VIEW_NAME],
+            },
+            timeout_seconds,
+        )
+    return {
+        "status": "materialized" if windows else "nothing_to_materialize",
+        "windows": len(windows),
+        "feature_view": FEATURE_VIEW_NAME,
+    }

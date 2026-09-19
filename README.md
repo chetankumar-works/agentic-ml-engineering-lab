@@ -19,9 +19,11 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 2 (Airflow + MinIO bronze/silver/gold batch pipeline, on top
-of Milestone 1's PostgreSQL + Kafka streaming ingestion) — see
-`PROJECT_STATE.md` for current detail and exact acceptance numbers.
+Milestone 3 (Feast feature store over curated Postgres, Redis online
+store, feature server called from the Airflow DAG) on top of Milestone
+2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
+streaming ingestion — see `PROJECT_STATE.md` for current detail and
+`MILESTONE_REPORT.md` for measured acceptance evidence per milestone.
 
 ## Quickstart
 
@@ -41,11 +43,21 @@ make fmt           # ruff format
 make typecheck     # mypy
 make test          # pytest — unit tests only, no infra required
 
-make up            # docker compose up: Postgres, Kafka, migrations, source_simulator, stream_ingestor
+make up            # docker compose up: Postgres, Kafka, MinIO, Redis, migrations, Airflow,
+                   #   feast-apply, feast-server, source_simulator, stream_ingestor
 make logs          # follow all service logs
 make smoke         # Milestone 1 acceptance check against a running `make up` stack
+make feast-materialize   # Milestone 3: chunked backfill of curated features into Redis
+make feast-demo          # Milestone 3: historical (point-in-time) + online retrieval demo
+make failure-simulator-wedge   # pauses Kafka ~30s; simulator probes must go 503 and recover
 make down          # stop everything
 ```
+
+Memory: this stack has been measured at roughly 5–6 GB resident with
+everything up (Kafka ~0.9 GB, Airflow ~1.5 GB, Redis ~0.5 GB at ~1M
+entities, feast-server ~0.2–0.4 GB). Every Feast container is
+memory-capped; do not run unbounded `feast materialize` — see
+`RUNBOOKS.md`.
 
 `.python-version` pins this project to Python 3.12 regardless of the
 system's default `python3`. `uv` reads it automatically.
@@ -81,3 +93,4 @@ tests/         cross-cutting/integration/e2e tests
 | `DECISIONS.md` | Architecture Decision Records |
 | `SECURITY.md` | Secret handling, auth model, reporting |
 | `RUNBOOKS.md` | Operational runbooks for failure scenarios |
+| `MILESTONE_REPORT.md` | Per-milestone report: what was built, how acceptance was proven (measured), decisions, bugs, gaps |

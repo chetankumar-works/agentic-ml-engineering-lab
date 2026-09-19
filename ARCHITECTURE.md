@@ -105,6 +105,109 @@ If a term shows up elsewhere in this document that isn't in that table,
 entry introduced it — that file is written explicitly to teach, not just
 to record.
 
+## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
+
+Three views, all of what is **built** as of Milestone 3 unless a node is
+marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
+
+### System context
+
+```mermaid
+flowchart LR
+    dev(["Developer / operator"]) -->|"make up, triggers DAGs,<br/>reads dashboards"| amel
+    higgs[("UCI HIGGS dataset<br/>~2.8 GB zip, cached locally")] -->|"streamed row by row"| amel
+
+    subgraph amel ["AMEL — Docker Compose on WSL2 (15 GB)"]
+        direction TB
+        sim["source_simulator"]
+        ing["stream_ingestor"]
+        af["Airflow: higgs_pipeline"]
+        fs["Feast feature server"]
+        inf["inference_api<br/>(planned, M5)"]
+        plat["platform_api / agents<br/>(planned, M11+)"]
+    end
+
+    amel -->|"predictions"| clients(["API clients<br/>(planned)"])
+    amel -->|"metrics, traces, logs"| obs["Prometheus / Grafana / Tempo / Loki<br/>(planned, M6)"]
+```
+
+### End-to-end data flow (built through Milestone 3)
+
+```mermaid
+flowchart TB
+    higgs[("HIGGS zip")] --> sim
+
+    subgraph ingest ["Milestone 1 — streaming ingestion"]
+        sim["source_simulator<br/>entity_id = higgs-{HIGGS_START_INDEX + i}<br/>dup / malformed injection"] -->|"higgs.features.v1"| kafka[("Kafka, KRaft")]
+        sim -->|"higgs.labels.v1<br/>delayed LABEL_DELAY_SECONDS"| kafka
+        kafka --> ing["stream_ingestor<br/>validate → batch upsert<br/>commit offsets after DB commit"]
+        ing -->|"ON CONFLICT DO NOTHING"| landing[("Postgres<br/>landing.higgs_feature_events<br/>landing.higgs_label_events")]
+        ing -->|"invalid"| dlq[("higgs.*.dlq")]
+    end
+
+    subgraph batch ["Milestone 2 — batch curation"]
+        landing -->|"ingested_at > watermark"| dag["Airflow higgs_pipeline<br/>every 5 min"]
+        dag -->|"bronze: raw parquet"| minio[("MinIO<br/>bronze / silver / gold / pipeline")]
+        dag -->|"silver: validated, flat"| minio
+        dag -->|"gold: training parquet"| minio
+        dag -->|"upsert + advance watermark<br/>(one transaction)"| curated[("Postgres<br/>curated.higgs_features<br/>curated.higgs_labels<br/>curated.training_records<br/>control.*")]
+    end
+
+    subgraph feature ["Milestone 3 — feature store"]
+        curated -->|"VIEW curated.higgs_features_flat<br/>28 typed columns"| offline["Feast offline store<br/>(Postgres)"]
+        registry[("Feast SQL registry<br/>Postgres db 'feast'")]
+        offline -->|"chunked materialize<br/>≤25k rows/window"| redis[("Redis<br/>online store")]
+        dag -->|"update_feature_store<br/>POST /materialize per window"| server["feast-server<br/>feast serve, 1 GB cap"]
+        server --> redis
+        server -.-> registry
+    end
+
+    subgraph consumers ["Consumers"]
+        offline -->|"get_historical_features<br/>point-in-time join"| train["Training<br/>(planned, M4)"]
+        redis -->|"get_online_features<br/>latest values"| infer["inference_api<br/>(planned, M5)"]
+        curated -->|"entity df from labels"| train
+    end
+```
+
+### What each milestone added
+
+```mermaid
+flowchart LR
+    subgraph M0 ["M0 — skeleton"]
+        m0a["uv workspace, Python 3.12 pin"]
+        m0b["ruff / mypy / pytest / Makefile"]
+        m0c["docs: ARCHITECTURE, DECISIONS,<br/>RUNBOOKS, LEARNING_LOG, PROJECT_STATE"]
+    end
+    subgraph M1 ["M1 — streaming ingestion"]
+        m1a["libs/amel_common<br/>versioned Pydantic events"]
+        m1b["libs/amel_db<br/>SQLAlchemy + Alembic 0001"]
+        m1c["services/source_simulator"]
+        m1d["services/stream_ingestor"]
+        m1e["Postgres + Kafka (KRaft)<br/>+ 7 topics + DLQs"]
+    end
+    subgraph M2 ["M2 — batch pipeline"]
+        m2a["libs/amel_lake<br/>MinIO client, keys, Pandera, watermark"]
+        m2b["Airflow 3.3.2 standalone<br/>higgs_pipeline DAG"]
+        m2c["MinIO bronze/silver/gold"]
+        m2d["Alembic 0002<br/>curated.* + control.*"]
+    end
+    subgraph M3 ["M3 — feature store"]
+        m3a["ml/feature_repo<br/>Feast entity + feature view v1"]
+        m3b["Alembic 0003<br/>curated.higgs_features_flat VIEW"]
+        m3c["Redis online store<br/>feast-server (always-on)"]
+        m3d["chunked materialization<br/>+ real update_feature_store"]
+        m3e["honest liveness/readiness<br/>in simulator + ingestor<br/>failure-engineering script"]
+    end
+    subgraph next ["M4+ (planned)"]
+        m4["Training + MLflow"]
+        m5["inference_api / platform_api"]
+        m6["OpenTelemetry stack"]
+        m8["Kubernetes"]
+    end
+    M0 --> M1 --> M2 --> M3 --> next
+```
+
+
 ## Why this shape
 
 AMEL simulates a realistic ML platform's operational surface: events
@@ -150,7 +253,7 @@ Each layer is built only after the one below it demonstrably works — see
 `PROJECT_STATE.md`'s milestone list for the authoritative sequencing and
 current status.
 
-## Data flow, current (Milestone 2)
+## Data flow, current (Milestone 3)
 
 ```
 UCI HIGGS zip (downloaded once, streamed row-by-row, never fully
@@ -182,18 +285,30 @@ higgs_pipeline (Airflow DAG, higgs_pipeline_tasks.py has the logic):
                                 for entities missing from curated.training_records —
                                 not this run's delta, so late-arriving labels are
                                 still picked up; upsert + MinIO gold/training/....parquet)
-    → update_feature_store    (stub — Feast lands in Milestone 3)
+    → update_feature_store    (rows this run inserted, by source_run_id →
+                                ≤25k-row windows → POST feast-server /materialize
+                                per window → Redis; zero rows → no call)
     → emit_pipeline_metadata  (one control.pipeline_runs row per run;
                                 on_failure_callback covers the failure path too)
+
+Feast (ml/feature_repo, DECISIONS.md ADR-0005):
+  registry      Postgres db `feast` (SQL registry; feature_view_version_history)
+  offline       Postgres VIEW curated.higgs_features_flat (28 typed columns
+                over curated.higgs_features' JSONB) — point-in-time joins for training
+  online        Redis, one key per entity_id, latest values — inference lookups
+  backfill      make feast-materialize (scripts/materialize.py, chunked, resumable)
+  steady state  the DAG task above, every 5 minutes
+  serving       feast-server: POST /get-online-features, POST /materialize
 ```
 
 Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
 (models + Alembic migrations), `libs/amel_lake` (MinIO client, object
 keys, Pandera validation, watermark read/advance),
 `services/source_simulator`, `services/stream_ingestor`,
-`infra/airflow/dags/`. Full reasoning, the three bugs found during the
-acceptance run, and what was actually verified: `LEARNING_LOG.md`'s
-Milestone 1 and Milestone 2 entries and `RUNBOOKS.md`.
+`infra/airflow/dags/`, `ml/feature_repo`. Full reasoning, the bugs found
+during each acceptance run, and what was actually verified:
+`LEARNING_LOG.md`'s Milestone 1–3 entries, `MILESTONE_REPORT.md`, and
+`RUNBOOKS.md`.
 
 ## Reliability properties established so far
 
@@ -214,6 +329,20 @@ Milestone 1 and Milestone 2 entries and `RUNBOOKS.md`.
   quarantines bad rows and fails the run above a configurable invalid
   threshold, rather than either silently dropping bad data or letting it
   flow downstream unchecked.
+- **Online/offline feature consistency by construction** (Milestone 3):
+  one feature definition serves both paths; materialization is recorded
+  per window in the registry; the acceptance demo asserts Redis values
+  equal Postgres values and that as-of-earlier requests return nothing
+  (no future leakage).
+- **Bounded memory for batch materialization** (Milestone 3): every
+  materialization is chunked (≤25k rows) and every Feast container is
+  memory-capped, after an unbounded run reached 12 GB and was OOM-killed.
+- **Honest probes** (Milestone 3): `source_simulator` and
+  `stream_ingestor` derive `/health` (liveness) and `/ready` (readiness)
+  from real producer/consumer state — a dead loop or fatal producer fails
+  liveness, current delivery/commit errors fail readiness — after both
+  services were found "healthy" while functionally dead for an hour.
+  `make failure-simulator-wedge` reproduces the incident as a test.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 

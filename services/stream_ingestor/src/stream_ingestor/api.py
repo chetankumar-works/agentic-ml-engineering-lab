@@ -18,15 +18,31 @@ def create_app(ingestor: StreamIngestor) -> FastAPI:
 
     app = FastAPI(title="AMEL stream ingestor", lifespan=lifespan)
 
+    # Probe contract in consumer.py's module docstring. Both must be
+    # honest: Milestone 8's Kubernetes probes inherit whatever these say.
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> Response:
+        live, reason = ingestor.liveness()
+        return PlainTextResponse(reason, status_code=200 if live else 503)
 
     @app.get("/ready")
     def ready() -> Response:
-        if ingestor.ready:
-            return PlainTextResponse("ready", status_code=200)
-        return PlainTextResponse("not ready: no partition assignment yet", status_code=503)
+        ok, reason = ingestor.readiness()
+        return PlainTextResponse(reason, status_code=200 if ok else 503)
+
+    @app.get("/status")
+    def status() -> dict[str, object]:
+        live, live_reason = ingestor.liveness()
+        ok, ready_reason = ingestor.readiness()
+        return {
+            "live": live,
+            "ready": ok,
+            "probe_reasons": {"health": live_reason, "ready": ready_reason},
+            "assigned": ingestor.assigned,
+            "commit_failures": ingestor.commit_failures,
+            "last_commit_error": ingestor.last_commit_error,
+            "loop_error": ingestor.loop_error,
+        }
 
     @app.get("/metrics")
     def metrics_endpoint() -> Response:

@@ -1,0 +1,19 @@
+[project]
+name = "amel-feature-repo"
+version = "0.1.0"
+description = "Feast feature repository: entities, feature views, and the historical/online retrieval demo"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "amel-common",
+    "amel-db",
+    "feast[postgres,redis]>=0.66",
+]
+
+[tool.uv.sources]
+amel-common = { workspace = true }
+amel-db = { workspace = true }
+
+[tool.uv]
+# Not an installable package — a Feast repo directory (feature_store.yaml
+# + definitions.py, Feast's own convention) plus a couple of scripts.
+package = false

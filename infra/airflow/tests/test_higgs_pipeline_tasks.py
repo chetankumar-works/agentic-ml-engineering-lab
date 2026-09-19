@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import higgs_pipeline_tasks as tasks
 import pandas as pd
@@ -87,3 +87,68 @@ def test_transform_labels_types_target_as_int() -> None:
 
     assert out["target"].dtype == "int64"
     assert out["target"].iloc[0] == 1
+
+
+def test_materialize_windows_split_contiguously_at_interior_boundaries() -> None:
+    t0 = datetime(2026, 9, 18, 20, 0)
+    t = lambda m: t0 + timedelta(minutes=m)  # noqa: E731
+    windows = tasks.materialize_windows(t(0), t(10), [t(-5), t(0), t(3), t(7), t(10), t(15)])
+    assert windows == [(t(0), t(3)), (t(3), t(7)), (t(7), t(10))]
+    assert tasks.materialize_windows(t(5), t(5), []) == []
+
+
+def test_update_feature_store_posts_one_materialize_call_per_window(monkeypatch) -> None:
+    t0 = datetime(2026, 9, 18, 20, 0)
+    monkeypatch.setattr(
+        tasks,
+        "materialize_windows_for_run",
+        lambda run_id, chunk_rows: [
+            (t0, t0.replace(minute=1)),
+            (t0.replace(minute=1), t0.replace(minute=2)),
+        ],
+    )
+    calls: list[tuple[str, dict, float]] = []
+
+    def fake_post(url: str, payload: dict, timeout: float) -> dict:
+        calls.append((url, payload, timeout))
+        return {}
+
+    result = tasks.update_feature_store("run-1", "http://feast-server:6566/", post=fake_post)
+
+    assert result == {"status": "materialized", "windows": 2, "feature_view": "higgs_features"}
+    assert [c[0] for c in calls] == ["http://feast-server:6566/materialize"] * 2
+    assert calls[0][1] == {
+        "start_ts": "2026-09-18T20:00:00",
+        "end_ts": "2026-09-18T20:01:00",
+        "feature_views": ["higgs_features"],
+    }
+    assert calls[1][1]["start_ts"] == calls[0][1]["end_ts"]  # contiguous
+
+
+def test_update_feature_store_skips_http_when_run_inserted_nothing(monkeypatch) -> None:
+    monkeypatch.setattr(tasks, "materialize_windows_for_run", lambda run_id, chunk_rows: [])
+
+    def explode(*_args: object) -> dict:
+        raise AssertionError("no HTTP call expected")
+
+    result = tasks.update_feature_store("run-1", "http://feast-server:6566", post=explode)
+
+    assert result["status"] == "nothing_to_materialize"
+    assert result["windows"] == 0
+
+
+def test_update_feature_store_propagates_server_errors(monkeypatch) -> None:
+    import pytest
+
+    t0 = datetime(2026, 9, 18, 20, 0)
+    monkeypatch.setattr(
+        tasks,
+        "materialize_windows_for_run",
+        lambda run_id, chunk_rows: [(t0, t0.replace(minute=1))],
+    )
+
+    def failing_post(*_args: object) -> dict:
+        raise OSError("connection refused")
+
+    with pytest.raises(OSError, match="connection refused"):
+        tasks.update_feature_store("run-1", "http://feast-server:6566", post=failing_post)

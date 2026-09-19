@@ -65,6 +65,18 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   minio:
     image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
@@ -118,6 +130,7 @@ services:
       AWS_SECRET_ACCESS_KEY: amel_dev_password
       AWS_REGION: us-east-1
       PIPELINE_STAGING_DIR: /opt/airflow/staging
+      FEAST_SERVER_URL: http://feast-server:6566
       HIGGS_PIPELINE_SCHEDULE: ${HIGGS_PIPELINE_SCHEDULE:-*/5 * * * *}
       VALIDATION_MAX_INVALID_FRACTION: ${VALIDATION_MAX_INVALID_FRACTION:-0.05}
       LOG_LEVEL: info
@@ -144,7 +157,11 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DATA_DIR: /data
       HIGGS_MAX_ROWS: ${HIGGS_MAX_ROWS:-500000}
+      # After a restart, set to (max landed index + 1) or every replayed
+      # entity_id is deduped and no new data reaches curated (RUNBOOKS.md).
+      HIGGS_START_INDEX: ${HIGGS_START_INDEX:-0}
       EVENTS_PER_SECOND: ${EVENTS_PER_SECOND:-100}
+      KAFKA_MESSAGE_TIMEOUT_MS: ${KAFKA_MESSAGE_TIMEOUT_MS:-30000}
       DUPLICATE_RATE: ${DUPLICATE_RATE:-0.01}
       INVALID_EVENT_RATE: ${INVALID_EVENT_RATE:-0.002}
       LABEL_DELAY_SECONDS: ${LABEL_DELAY_SECONDS:-10}
@@ -181,8 +198,80 @@ services:
       retries: 10
       start_period: 15s
 
+  feast-apply:
+    build:
+      context: ..
+      dockerfile: infra/feast/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    command: ["feast", "apply"]
+    mem_limit: 1g
+
+  # Always-on (deliberately — see DECISIONS.md ADR-0005): the scheduled
+  # DAG's update_feature_store task POSTs /materialize here every 5 min,
+  # and this keeps Feast's dependency tree out of the Airflow image. One
+  # idle uvicorn process (~250 MB); the hard cap means a runaway
+  # materialization is OOM-killed inside this container, not WSL2.
+  feast-server:
+    build:
+      context: ..
+      dockerfile: infra/feast/Dockerfile
+    depends_on:
+      feast-apply:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: ["feast", "serve", "--host", "0.0.0.0", "--port", "6566", "--no-access-log"]
+    ports:
+      - "6566:6566"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6566/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  feast-materialize:
+    profiles: ["feast-demo"]
+    build:
+      context: ..
+      dockerfile: infra/feast/Dockerfile
+    depends_on:
+      feast-apply:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
+    # Chunked, not `feast materialize-incremental`: the plain CLI loads
+    # the whole window into memory and was OOM-killed at 12 GB RSS over
+    # the ~885k-row curated table (RUNBOOKS.md). Resumes from the
+    # registry, so re-running is cheap.
+    command: ["python", "scripts/materialize.py"]
+    mem_limit: 2g
+
+  feast-demo:
+    profiles: ["feast-demo"]
+    build:
+      context: ..
+      dockerfile: infra/feast/Dockerfile
+    depends_on:
+      feast-apply:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
+    command: ["python", "scripts/demo_retrieval.py"]
+    mem_limit: 2g
+
 volumes:
   postgres-data:
   kafka-data:
   minio-data:
   airflow-staging:
+  redis-data:
