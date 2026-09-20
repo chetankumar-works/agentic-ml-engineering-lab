@@ -13,4 +13,6 @@ COPY apps ./apps
 RUN uv sync --frozen --no-dev --package amel-db
 
 WORKDIR /app/libs/amel_db
+RUN useradd --create-home --uid 1000 amel
+USER amel
 ENTRYPOINT ["/app/.venv/bin/alembic", "upgrade", "head"]

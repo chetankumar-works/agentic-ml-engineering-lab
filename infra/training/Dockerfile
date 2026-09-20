@@ -18,5 +18,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     TRAINING_FEATURE_REPO_PATH=/app/ml/feature_repo \
     MLFLOW_DISABLE_AGENT_HINT=1 \
     GIT_PYTHON_REFRESH=quiet
+RUN useradd --create-home --uid 1000 amel
+USER amel
 ENTRYPOINT ["amel-train"]
 CMD ["train"]

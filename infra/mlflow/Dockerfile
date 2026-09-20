@@ -12,5 +12,10 @@ FROM python:3.12-slim-bookworm
 ARG MLFLOW_VERSION=3.16.1
 RUN pip install --no-cache-dir "mlflow==${MLFLOW_VERSION}" "psycopg2-binary>=2.9" "boto3>=1.35"
 
+# Non-root (Milestone 7): with --serve-artifacts to S3 the server keeps
+# no local state beyond its own scratch dir.
+RUN useradd --create-home --uid 1000 mlflow
+USER mlflow
+WORKDIR /home/mlflow
 EXPOSE 5000
 ENTRYPOINT ["mlflow", "server", "--host", "0.0.0.0", "--port", "5000"]

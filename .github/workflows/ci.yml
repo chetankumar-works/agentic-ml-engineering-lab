@@ -1,0 +1,137 @@
+# AMEL CI (Milestone 7, DECISIONS.md ADR-0009).
+#
+# Every push/PR: quality (ruff, format, mypy, pytest), compose validation,
+# dependency vulnerability scan, image builds (tagged with the commit SHA),
+# and a small real integration run (Postgres + Kafka + simulator + ingestor
+# on a synthetic HIGGS archive, then the Milestone 1 smoke test).
+# main only: push the built images to GHCR. Nothing deploys anywhere.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["milestone-*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UV_FROZEN: "1"
+  MLFLOW_DISABLE_AGENT_HINT: "1"
+
+jobs:
+  quality:
+    name: lint · format · typecheck · unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-packages
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy .
+      - run: uv run pytest -q
+
+  compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f infra/docker-compose.yml --profile train --profile feast-demo config -q
+
+  security:
+    name: dependency vulnerability scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          skip-dirs: .venv
+          exit-code: "1"
+
+  images:
+    name: build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [quality]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: source-simulator, dockerfile: services/source_simulator/Dockerfile }
+          - { image: stream-ingestor, dockerfile: services/stream_ingestor/Dockerfile }
+          - { image: inference-api, dockerfile: apps/inference_api/Dockerfile }
+          - { image: migrate, dockerfile: infra/db/Dockerfile }
+          - { image: feast, dockerfile: infra/feast/Dockerfile }
+          - { image: training, dockerfile: infra/training/Dockerfile }
+          - { image: mlflow, dockerfile: infra/mlflow/Dockerfile }
+          - { image: airflow, dockerfile: infra/airflow/Dockerfile }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push on main/tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/${{ matrix.image }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/${{ matrix.image }}:${{ github.ref_name }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+  integration:
+    name: integration — ingestion on a synthetic dataset
+    runs-on: ubuntu-latest
+    needs: [quality, compose-config]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-packages
+      - name: Synthetic HIGGS archive (the real one is 2.8 GB from an unreliable host)
+        run: uv run python scripts/make_synthetic_higgs.py --rows 20000 --out data/raw/higgs.zip
+      - name: Start the ingestion slice
+        run: |
+          docker compose -f infra/docker-compose.yml up -d --build --wait \
+            postgres kafka kafka-init migrate source-simulator stream-ingestor
+        env:
+          EVENTS_PER_SECOND: "500"
+      - name: Milestone 1 smoke (reduced threshold)
+        run: uv run python scripts/smoke_milestone1.py
+        env:
+          SMOKE_MIN_FEATURE_EVENTS: "5000"
+          SMOKE_TIMEOUT_SECONDS: "300"
+      - name: Probes are honest
+        run: |
+          curl -fsS localhost:8001/ready && echo && curl -fsS localhost:8002/ready && echo
+          curl -fsS localhost:8002/status
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f infra/docker-compose.yml logs --tail=100
+      - name: Tear down
+        if: always()
+        run: docker compose -f infra/docker-compose.yml down -v

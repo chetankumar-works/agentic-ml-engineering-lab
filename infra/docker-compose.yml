@@ -2,6 +2,7 @@ name: amel
 
 services:
   postgres:
+    restart: unless-stopped
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: amel
@@ -19,6 +20,7 @@ services:
       retries: 20
 
   kafka:
+    restart: unless-stopped
     image: apache/kafka:3.9.0
     environment:
       KAFKA_NODE_ID: 1
@@ -66,6 +68,7 @@ services:
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
 
   redis:
+    restart: unless-stopped
     image: redis:7-alpine
     ports:
       - "6380:6379"
@@ -78,7 +81,8 @@ services:
       retries: 20
 
   minio:
-    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: amel
@@ -95,7 +99,7 @@ services:
       retries: 20
 
   minio-init:
-    image: quay.io/minio/mc:latest
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy
@@ -108,6 +112,7 @@ services:
       MINIO_ROOT_PASSWORD: amel_dev_password
 
   airflow:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: infra/airflow/Dockerfile
@@ -157,6 +162,7 @@ services:
       start_period: 60s
 
   source-simulator:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: services/source_simulator/Dockerfile
@@ -190,6 +196,7 @@ services:
       start_period: 30s
 
   stream-ingestor:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: services/stream_ingestor/Dockerfile
@@ -230,6 +237,7 @@ services:
   # idle uvicorn process (~250 MB); the hard cap means a runaway
   # materialization is OOM-killed inside this container, not WSL2.
   feast-server:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: infra/feast/Dockerfile
@@ -264,6 +272,7 @@ services:
   # the champion alias through it. Memory-capped like every other
   # non-core container on this 15 GB host.
   mlflow:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: infra/mlflow/Dockerfile
@@ -303,6 +312,7 @@ services:
   # Loads the model once at start-up (needs mlflow up *then*), caches it,
   # refreshes only via POST /model/refresh or the optional poll.
   inference-api:
+    restart: unless-stopped
     build:
       context: ..
       dockerfile: apps/inference_api/Dockerfile
@@ -342,7 +352,12 @@ services:
   # --- Observability (Milestone 6, DECISIONS.md ADR-0008) -------------------
   # Every first-party service sends OTLP to the collector; Prometheus
   # scrapes /metrics directly. All five are memory-capped and keep 24h.
+  # No in-image healthchecks for the collector, Tempo and Loki: their
+  # images are distroless (no shell/wget). Liveness is covered by
+  # `restart: unless-stopped` plus Prometheus scraping the collector and
+  # Grafana's datasource health; `make smoke-tracing` is the real check.
   otel-collector:
+    restart: unless-stopped
     image: otel/opentelemetry-collector-contrib:0.161.0
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
@@ -357,7 +372,8 @@ services:
     mem_limit: 256m
 
   tempo:
-    image: grafana/tempo:latest
+    restart: unless-stopped
+    image: grafana/tempo:3.0.0
     command:
       - "-config.file=/etc/tempo.yaml"
       - "-backend-scheduler.provider.work.compaction.block-retention=24h"
@@ -369,7 +385,8 @@ services:
     mem_limit: 512m
 
   loki:
-    image: grafana/loki:latest
+    restart: unless-stopped
+    image: grafana/loki:3.7.8
     command: ["-config.file=/etc/loki/loki.yaml"]
     volumes:
       - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
@@ -379,7 +396,8 @@ services:
     mem_limit: 512m
 
   prometheus:
-    image: prom/prometheus:latest
+    restart: unless-stopped
+    image: prom/prometheus:v3.14.0
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=2d"
@@ -390,9 +408,16 @@ services:
     ports:
       - "9090:9090"
     mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   kafka-exporter:
-    image: danielqsj/kafka-exporter:latest
+    restart: unless-stopped
+    image: danielqsj/kafka-exporter:v1.10.0
     command: ["--kafka.server=kafka:9092"]
     depends_on:
       kafka:
@@ -400,7 +425,8 @@ services:
     mem_limit: 64m
 
   grafana:
-    image: grafana/grafana:latest
+    restart: unless-stopped
+    image: grafana/grafana:13.2.2
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
@@ -421,6 +447,12 @@ services:
     mem_limit: 256m
 
   # One-shot training run (Milestone 4): `make train`, `make promote`.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
   train:
     profiles: ["train"]
     build:

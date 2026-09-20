@@ -19,6 +19,10 @@ RUN uv sync --frozen --no-dev --package amel-feature-repo
 
 WORKDIR /app/ml/feature_repo
 ENV PATH="/app/.venv/bin:$PATH"
+# Non-root (Milestone 7): Feast writes nothing locally (SQL registry,
+# Redis, Postgres); the auto-instrumentation only needs /tmp.
+RUN useradd --create-home --uid 1000 amel && chown -R amel:amel /app/ml/feature_repo
+USER amel
 # No fixed ENTRYPOINT/CMD — infra/docker-compose.yml's feast-apply,
 # feast-materialize, and feast-demo services each pass their own command
 # (`feast apply`, `feast materialize-incremental ...`,

@@ -1,4 +1,5 @@
 .git/
+.github/
 .venv/
 data/
 .pytest_cache/
@@ -8,3 +9,11 @@ __pycache__/
 *.pyc
 mlruns/
 mlartifacts/
+# docs and infra configs are mounted or irrelevant to Python images
+*.md
+infra/observability/
+infra/kafka/
+infra/minio/
+infra/postgres/
+infra/airflow/logs/
+.env
