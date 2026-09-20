@@ -107,7 +107,7 @@ to record.
 
 ## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
 
-Three views, all of what is **built** as of Milestone 5 unless a node is
+Three views, all of what is **built** as of Milestone 6 unless a node is
 marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
 
 ### System context
@@ -129,10 +129,10 @@ flowchart LR
     end
 
     amel -->|"POST /predict/raw, /predict/entity/{id}"| clients(["API clients"])
-    amel -->|"metrics, traces, logs"| obs["Prometheus / Grafana / Tempo / Loki<br/>(planned, M6)"]
+    amel -->|"OTLP traces + logs, /metrics scrapes"| obs["OTel Collector → Tempo / Loki<br/>Prometheus → Grafana"]
 ```
 
-### End-to-end data flow (built through Milestone 5)
+### End-to-end data flow (built through Milestone 6)
 
 ```mermaid
 flowchart TB
@@ -174,12 +174,32 @@ flowchart TB
         promote -->|"ml.model_promotions"| curated
     end
 
+    subgraph obs ["Milestone 6 — observability"]
+        otel["OTel Collector<br/>traces → Tempo · logs → Loki<br/>spanmetrics → Prometheus"]
+        tempo[("Tempo")]
+        loki[("Loki")]
+        prom[("Prometheus<br/>+ kafka-exporter lag")]
+        graf["Grafana<br/>Prom · Tempo · Loki · Postgres"]
+        otel --> tempo
+        otel --> loki
+        otel --> prom
+        prom --> graf
+        tempo --> graf
+        loki --> graf
+        curated -.->|"pipeline runs, predictions, promotions"| graf
+    end
+
     subgraph serving ["Milestone 5 — serving"]
         registry_m -->|"models:/...@champion<br/>loaded once, POST /model/refresh"| infer["inference_api<br/>:8003"]
         server -->|"POST /get-online-features"| infer
         client(["caller"]) -->|"POST /predict/entity/{id}<br/>POST /predict/raw"| infer
         infer -->|"ml.predictions (record)"| curated
         infer -->|"predictions.v1 (notification)"| kafka
+        infer -.->|"OTLP"| otel
+        server -.->|"OTLP (auto-instrumented)"| otel
+        sim -.->|"OTLP"| otel
+        ing -.->|"OTLP"| otel
+        dag -.->|"OTLP (native)"| otel
     end
 ```
 
@@ -222,12 +242,18 @@ flowchart LR
         m5a["apps/inference_api<br/>cached champion, controlled refresh"]
         m5b["Alembic 0005 ml.predictions<br/>PredictionEvent -> predictions.v1"]
     end
-    subgraph next ["M6+ (planned)"]
+    subgraph M6 ["M6 — observability"]
+        m6a["amel_common.telemetry<br/>OTLP + instrumentors"]
+        m6b["logs via stdlib → OTLP<br/>trace_id on every line"]
+        m6c["Collector · Tempo · Loki<br/>Prometheus · Grafana"]
+        m6d["make smoke-tracing"]
+    end
+    subgraph next ["M7+ (planned)"]
         m5["platform_api"]
-        m6["OpenTelemetry stack"]
+        m7["Docker hardening + CI"]
         m8["Kubernetes"]
     end
-    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> next
+    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> next
 ```
 
 
@@ -276,7 +302,7 @@ Each layer is built only after the one below it demonstrably works — see
 `PROJECT_STATE.md`'s milestone list for the authoritative sequencing and
 current status.
 
-## Data flow, current (Milestone 5)
+## Data flow, current (Milestone 6)
 
 ```
 UCI HIGGS zip (downloaded once, streamed row-by-row, never fully
@@ -337,6 +363,15 @@ Serving (apps/inference_api, DECISIONS.md ADR-0007):
   POST /predict/raw           validated 28 features → same path
   POST /model/refresh         (X-Admin-Token) reload alias, atomic swap; failure keeps serving
   /health = process ok · /ready = model loaded + feast-server + Postgres + Kafka delivery
+
+Observability (DECISIONS.md ADR-0008):
+  every first-party service  amel_common.telemetry → OTLP/HTTP → otel-collector:4318
+  feast-server               opentelemetry-instrument (FastAPI + redis)
+  airflow                    native OTel → otel-collector:4317 (gRPC)
+  otel-collector             traces → tempo · logs → loki (OTLP) · spanmetrics → :8889
+  prometheus                 scrapes simulator/ingestor/inference /metrics, collector, kafka-exporter
+  grafana :3000              datasources Prometheus/Tempo/Loki/AMEL Postgres; "AMEL overview"
+  one id                     X-Trace-Id == OTel trace id == log trace_id == ml.predictions.trace_id
 ```
 
 Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
@@ -390,6 +425,10 @@ during each acceptance run, and what was actually verified:
   cached and swapped atomically on a controlled refresh; MLflow being
   down does not affect predictions (proven), and every prediction is
   persisted before it is published.
+- **End-to-end traceability** (Milestone 6): one id links a
+  prediction's response, its spans across services (Tempo), its log
+  lines (Loki) and its database row; proven repeatably by
+  `make smoke-tracing`.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 
@@ -403,6 +442,8 @@ during each acceptance run, and what was actually verified:
 - **Authorization**: JWT-based roles/scopes (Milestone 5+ for the APIs
   that need it), agent state-changing actions additionally gated by risk
   classification + policy evaluation (Milestone 12+).
-- **Observability**: trace IDs propagate from ingestion through
-  inference; every first-party service emits structured logs correlated
-  to trace IDs.
+- **Observability** (built, Milestone 6): W3C trace context propagates
+  over HTTP and Kafka headers; every first-party service emits
+  structured JSON logs carrying the active trace/span ids, shipped via
+  the OTel Collector to Loki; traces to Tempo; metrics to Prometheus;
+  Grafana on top.

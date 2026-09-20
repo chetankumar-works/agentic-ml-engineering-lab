@@ -1,0 +1,18 @@
+# Tempo 3.x, single binary, local disk. Retention is a CLI flag in 3.x
+# (-backend-scheduler.provider.work.compaction.block-retention, see
+# infra/docker-compose.yml); the YAML only knows receivers and storage.
+server:
+  http_listen_port: 3200
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

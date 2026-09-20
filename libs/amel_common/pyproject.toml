@@ -7,6 +7,15 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "structlog>=24.4",
+    # OpenTelemetry (Milestone 6): one shared configure_telemetry() so every
+    # first-party service traces, logs and propagates context the same way.
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.51b0",
+    "opentelemetry-instrumentation-httpx>=0.51b0",
+    "opentelemetry-instrumentation-confluent-kafka>=0.51b0",
+    "opentelemetry-instrumentation-logging>=0.51b0",
 ]
 
 [build-system]

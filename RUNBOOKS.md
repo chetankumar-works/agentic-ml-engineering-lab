@@ -388,3 +388,37 @@ group** for an hour.
   wedged should fail liveness.
 - `curl localhost:8003/metrics | grep amel_inference_` for
   `persist_failures_total` / `publish_failures_total` trends.
+
+## Traces or logs missing in Grafana
+
+- Symptom: Tempo search for a service returns nothing; Loki has no
+  `service_name` label for it; or `/predict` responses carry an
+  `X-Trace-Id` Tempo cannot find.
+- Diagnosis:
+  ```bash
+  docker logs --since 5m amel-otel-collector-1 | grep -i 'error\|refused'
+  docker exec amel-inference-api-1 env | grep OTEL_        # OTEL_ENABLED=true?
+  docker logs --since 5m amel-inference-api-1 | grep -i 'export\|otlp'
+  curl -s localhost:3200/ready; curl -s localhost:3100/ready
+  curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c
+  make smoke-tracing
+  ```
+- Likely causes: `OTEL_ENABLED` unset (telemetry is opt-in); collector
+  down or its DNS to `tempo`/`loki` failing at start-up (it retries);
+  Airflow pointed at the HTTP port (it speaks gRPC → use 4317); a
+  service restarted before its batch exporter flushed (spans are
+  batched ~2–5 s).
+- Data-loss implications: telemetry only; nothing operational.
+- Prevention: `make smoke-tracing` after any change to the collector
+  config or a service's telemetry wiring.
+
+## Observability containers pushing the host's memory
+
+- `docker stats --no-stream | grep -E "tempo|loki|prom|grafana|otel"` —
+  expected ≈ 0.9 GB total (Tempo ~280 MB, Grafana ~190, Prometheus
+  ~140, collector ~130, Loki ~125, kafka-exporter ~30). All are capped
+  (`mem_limit`), so an OOM is a container restart, not a VM freeze.
+- To shed load without losing the stack: shorten retention
+  (`--storage.tsdb.retention.time`, Tempo/Loki 24 h flags/config),
+  raise the collector's `memory_limiter`, or `docker compose stop
+  grafana` when not looking at dashboards.

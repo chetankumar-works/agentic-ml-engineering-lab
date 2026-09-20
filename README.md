@@ -19,9 +19,10 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 5 (FastAPI inference serving the cached MLflow champion over
-raw or Feast-online features, persisting and publishing every
-prediction) on top of Milestone 4's reproducible training + MLflow
+Milestone 6 (OpenTelemetry in every first-party service, Collector →
+Tempo/Loki/Prometheus, Grafana dashboards; one id links a prediction's
+response, trace, logs and DB row) on top of Milestone 5's FastAPI
+inference API, Milestone 4's reproducible training + MLflow
 registry, Milestone 3's Feast/Redis feature store, Milestone
 2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
 streaming ingestion — see `PROJECT_STATE.md` for current detail and
@@ -55,8 +56,12 @@ make failure-simulator-wedge   # pauses Kafka ~30s; simulator probes must go 503
 make train                     # Milestone 4: one training run -> MLflow, registered, aliased candidate
 make promote DECIDED_BY=you    # explicit, audited candidate -> champion (exit 2 if criteria fail)
 make model-show                # current candidate/champion
+make smoke-tracing             # Milestone 6: one prediction traced response -> Tempo -> Loki -> Postgres
 make down          # stop everything
 ```
+
+Grafana: http://localhost:3000 (anonymous admin, "AMEL overview"),
+Prometheus :9090, Tempo :3200, Loki :3100.
 
 MLflow UI: http://localhost:5000. Airflow UI: http://localhost:8080.
 Inference API: http://localhost:8003/docs (OpenAPI).
@@ -64,7 +69,8 @@ Inference API: http://localhost:8003/docs (OpenAPI).
 Memory: this stack has been measured at roughly 5–6 GB resident with
 everything up (Kafka ~0.9 GB, Airflow ~1.5 GB, Redis ~0.5 GB at ~1M
 entities, feast-server ~0.2–0.4 GB, MLflow ~0.5 GB, inference-api
-~0.25 GB). Every Feast container is
+~0.25 GB); the observability stack adds ≈0.9 GB (all capped). ~9 GB of
+15 with everything up. Every Feast container is
 memory-capped; do not run unbounded `feast materialize` — see
 `RUNBOOKS.md`.
 

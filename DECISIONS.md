@@ -464,3 +464,79 @@ API's `models:promote`/`deployments:write` scopes; add a canary
 (serve `@candidate` to a fraction of traffic) once there is traffic
 worth splitting; make persistence async if p95 latency matters more
 than write-before-publish ordering.
+
+## ADR-0008: Observability — one collector, OTLP from every first-party service, spanmetrics, Grafana over Prometheus + Tempo + Loki + Postgres
+
+**Problem.** Milestone 6 needed a single prediction traceable across
+service boundaries, logs correlated to traces, metrics in Prometheus and
+dashboards in Grafana — on a host with ~8 GB of headroom and a history
+of memory crashes.
+
+**Decision.**
+1. **One shared `amel_common.telemetry` module.** `configure_telemetry()`
+   sets up the tracer and logger providers (OTLP/HTTP to
+   `otel-collector:4318`), W3C propagation, and instrumentors for
+   FastAPI, SQLAlchemy, httpx and confluent-kafka. Services call it
+   once; it is a no-op unless `OTEL_ENABLED=true`, so tests never need
+   a collector.
+2. **Logs go through stdlib `logging`** (structlog renders, stdlib
+   emits) so one OTLP handler ships every line to Loki with
+   `trace_id`/`span_id` injected from the active span; stdout keeps the
+   same JSON. No log-scraping sidecar.
+3. **The API's `X-Trace-Id` *is* the OpenTelemetry trace id** when a
+   span is active (else the caller's header, else fresh) — the id in the
+   response is the id in Tempo, in Loki and in `ml.predictions`.
+4. **feast-server is auto-instrumented** (`opentelemetry-instrument
+   feast serve`) so the feature fetch continues the trace into Feast and
+   its Redis `HMGET`. **Airflow** uses its native OTel integration (gRPC
+   to the collector) for DAG-run/task spans.
+5. **Collector pipelines:** traces → Tempo (and a `spanmetrics`
+   connector → Prometheus exporter: request rate, errors, duration per
+   service/route, derived from spans); logs → Loki's native OTLP
+   endpoint. **Prometheus** scrapes the services' existing `/metrics`,
+   the collector's spanmetrics, and a `kafka-exporter` for consumer
+   lag. **Grafana** is provisioned with Prometheus/Tempo/Loki and a
+   **Postgres datasource** so dashboard panels can show pipeline runs,
+   predictions per model version and the promotion audit straight from
+   the tables. Trace→logs and logs→trace links are provisioned.
+6. Kafka consumer spans are **linked**, not parented, to producer spans
+   (OTel messaging semantics for batch consumers): a feature event is
+   two traces — `higgs.features.v1 send` in the simulator and `recv` in
+   the ingestor — joined by a link, with `ingest_batch` spans over the
+   DB transaction.
+7. Everything is memory-capped and retention is short (Tempo 24 h via
+   the 3.x `backend-scheduler` flag, Loki 24 h, Prometheus 2 d):
+   collector 256 MB, Tempo 512, Loki 512, Prometheus 512, Grafana 256,
+   kafka-exporter 64. Measured steady state ≈ 0.9 GB for all six.
+
+**Reason.**
+1–3. Tracing only pays off when every hop propagates the same way and
+   the operator can pivot from a response to its trace to its logs
+   without translating ids. Proven by `make smoke-tracing`: one id in
+   the response header, a 13-span trace across `inference_api` and
+   `feast_server` in Tempo, the log line in Loki, the row in Postgres.
+4. The feature fetch is the one cross-service hop a prediction makes;
+   without instrumenting Feast the trace would stop at an httpx client
+   span. Auto-instrumentation costs one command-line prefix.
+5. Spanmetrics give RED metrics for services that expose no Prometheus
+   endpoint of their own (feast-server, Airflow) for free; the Postgres
+   datasource avoids building metrics for facts the database already
+   holds.
+6. A single poll can return messages from many producers and traces;
+   parenting one batch span to one of them would be a lie.
+7. Five new always-on containers on this host must be a deliberate,
+   measured decision (Milestone 3's lesson); caps make a runaway a
+   container exit, not a VM freeze.
+
+**Tradeoffs.** Only first-party Python logs reach Loki (Kafka, Postgres,
+MinIO container logs do not — `docker logs` still works; a Docker
+log-scraper is the upgrade path). Grafana is anonymous-admin (dev only).
+The dashboard is one hand-written JSON; alerting is not configured.
+Airflow's exporter ignores `OTEL_EXPORTER_OTLP_PROTOCOL` and needs the
+gRPC port. Tempo 3.x has no YAML key for retention.
+
+**Future reconsideration trigger.** Add Grafana Alloy for Docker/
+Kubernetes log collection in Milestone 8; alert rules once the platform
+event model (Milestone 11) defines what an incident is; OTel metrics
+export from the SDK if `/metrics` scraping becomes awkward under
+Kubernetes.

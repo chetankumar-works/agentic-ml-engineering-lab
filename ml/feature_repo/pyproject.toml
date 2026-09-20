@@ -7,6 +7,12 @@ dependencies = [
     "amel-common",
     "amel-db",
     "feast[postgres,redis]>=0.66",
+    # Milestone 6: `opentelemetry-instrument feast serve` (auto-instrumentation
+    # of Feast's FastAPI app + redis client) — see infra/docker-compose.yml.
+    "opentelemetry-distro>=0.51b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
+    "opentelemetry-instrumentation-redis>=0.51b0",
 ]
 
 [tool.uv.sources]

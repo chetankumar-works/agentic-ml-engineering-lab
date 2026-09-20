@@ -3,6 +3,7 @@ from __future__ import annotations
 import uvicorn
 from amel_common.logging import configure_logging, get_logger
 
+from amel_common import telemetry
 from inference_api.api import create_app
 from inference_api.config import Settings
 from inference_api.features import FeastOnlineClient
@@ -14,6 +15,10 @@ from inference_api.store import PredictionStore
 
 def main() -> None:
     settings = Settings()
+    telemetry.configure_telemetry(
+        settings.service_name
+    )  # before logging: attaches the OTLP handler
+    telemetry.instrument_httpx()  # feast-server calls carry traceparent
     configure_logging(settings.service_name, settings.log_level)
     get_logger(component="main").info(
         "inference_api_booting",
@@ -31,9 +36,9 @@ def main() -> None:
         store=PredictionStore(),
         publisher=PredictionPublisher(settings.kafka_bootstrap_servers, settings.predictions_topic),
     )
-    uvicorn.run(
-        create_app(service, settings), host="0.0.0.0", port=settings.http_port, log_config=None
-    )  # noqa: S104
+    app = create_app(service, settings)
+    telemetry.instrument_fastapi(app)
+    uvicorn.run(app, host="0.0.0.0", port=settings.http_port, log_config=None)  # noqa: S104
 
 
 if __name__ == "__main__":

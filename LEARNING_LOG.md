@@ -893,3 +893,100 @@ leaves the old model serving).
 - "Where do you validate inference inputs and why exactly there?"
 - "What do you persist per prediction and what do you publish?"
 - "Why does readiness not check the registry?"
+
+## Milestone 6 — OpenTelemetry and observability stack
+
+**WHAT WAS BUILT.** `amel_common.telemetry` (tracer + logger providers,
+OTLP/HTTP export, FastAPI/SQLAlchemy/httpx/confluent-kafka
+instrumentors, trace-id helpers) and a reworked `amel_common.logging`
+that routes structlog through stdlib so an OTLP handler ships every
+line with trace/span ids. All three Python services and the DB engine
+call it; the inference API's `X-Trace-Id` is now the OTel trace id;
+feast-server runs under `opentelemetry-instrument`; Airflow's native
+OTel is on. Infra: OTel Collector (traces → Tempo, logs → Loki,
+spanmetrics → Prometheus), Tempo 3, Loki 3, Prometheus 3, kafka-exporter,
+Grafana 13 with provisioned datasources (Prometheus, Tempo, Loki, AMEL
+Postgres), trace↔log links and an "AMEL overview" dashboard (11 panels).
+`scripts/smoke_milestone6.py` / `make smoke-tracing`. ADR-0008.
+
+**WHY IT EXISTS.** Milestone 3's incident was an hour of "healthy"
+services doing nothing. Probes fixed the lie; observability answers the
+next questions: *what* is slow, *where* a request spent its time, *which*
+log lines belong to *this* request, and how the system looks over time.
+Milestone 12's agents will read the same signals.
+
+**HOW A PREDICTION IS TRACED.**
+1. A caller sends `POST /predict/entity/{id}` (optionally with W3C
+   `traceparent`; otherwise the FastAPI instrumentation starts a trace).
+2. `inference_api` server span → httpx client span carrying
+   `traceparent` → `feast_server` server span (auto-instrumented) →
+   Redis `HMGET` client span → back → SQLAlchemy `INSERT amel` span →
+   Kafka `predictions.v1 send` producer span (traceparent injected into
+   message headers) → response with `X-Trace-Id` = the trace id.
+3. The API's `prediction_request` log line carries the same
+   `trace_id`/`span_id` → collector → Loki; Grafana's Tempo datasource
+   links "logs for this span" to Loki and Loki's derived field links
+   `trace_id` back to Tempo.
+4. The collector's `spanmetrics` connector turns every span into
+   `traces_span_metrics_calls_total` / `_duration_*` by service and
+   route → Prometheus → the dashboard's RED panel.
+Proven by `make smoke-tracing`: 13 spans, 2 services, 1 Loki line, 1
+Postgres row, 6 Prometheus targets up, RED metrics for 5 services.
+
+**HOW INGESTION IS TRACED.** The simulator's producer is wrapped, so
+each `higgs.features.v1 send` is a producer span with `traceparent` in
+the headers. The ingestor's consumer is wrapped: each `poll()` returns
+a message and opens a `recv` span *linked* to the producer's span (not
+parented — one poll can carry many producers' traces), and
+`_process_batch` wraps the DB transaction in an `ingest_batch` span.
+
+**IMPORTANT CODE FILES.**
+- `libs/amel_common/src/amel_common/telemetry.py` — read top to bottom.
+- `libs/amel_common/src/amel_common/logging.py` — `_add_trace_ids`
+  and the stdlib routing.
+- `apps/inference_api/src/inference_api/api.py` — `trace_id()`.
+- `infra/observability/otel-collector/config.yaml` — the pipelines.
+- `infra/observability/grafana/provisioning/datasources/datasources.yaml`
+  — the trace↔log correlation config.
+- `infra/observability/grafana/dashboards/amel-overview.json`.
+- `scripts/smoke_milestone6.py`.
+
+**FAILURE MODES / SURPRISES (exercised).**
+- Tempo 3 rejects `compactor:`/`block_retention` YAML — retention is a
+  `backend-scheduler` CLI flag now.
+- Airflow's exporter selection ignores `OTEL_EXPORTER_OTLP_PROTOCOL`
+  and speaks gRPC: pointing it at 4318 produced "Expected SETTINGS
+  frame" errors until moved to 4317.
+- The API minted its own `X-Trace-Id` before this milestone, so logs
+  and traces had different ids — fixed by deriving it from the span.
+- Kafka consumer spans arrive as separate linked traces; expecting one
+  trace per message is a misunderstanding of OTel batch semantics.
+- Grafana's Postgres datasource is `grafana-postgresql-datasource`
+  (not `postgres`) in 13.x.
+
+**HOW TO TEST IT.**
+- Unit (`make test`): unchanged — telemetry is off by default.
+- Live: `make up` → `make smoke-tracing`. Grafana http://localhost:3000
+  (AMEL overview), Prometheus :9090, Tempo :3200, Loki :3100.
+  `curl -s localhost:3200/api/search?q=...` / `loki/api/v1/query_range`.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Traces vs metrics vs logs, and the one id that joins them.
+- W3C `traceparent` propagation over HTTP headers and Kafka message
+  headers; spans, kinds (server/client/producer/consumer), links.
+- Collector as the single fan-out point; why services never talk to
+  Tempo/Loki directly.
+- RED metrics derived from spans vs metrics a service emits itself.
+- Sampling, retention and cardinality as the cost levers (none
+  needed at this scale; all three would be the first knobs at real
+  scale).
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "A user reports one slow prediction. Walk me from their response to
+  the exact slow hop." (X-Trace-Id → Tempo → the 89 ms `feast_server`
+  span → Redis or network)
+- "How do logs get their trace id?" (processor reads the active span)
+- "Why are your Kafka consumer spans not children of the producer
+  span?"
+- "What does an OTel Collector give you over exporting directly?"
+- "What would you cap or sample first if this ran at 100× the volume?"

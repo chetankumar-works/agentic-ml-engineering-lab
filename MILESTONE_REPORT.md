@@ -272,3 +272,36 @@ an MLflow outage blocked ~3 min (client retries capped); stale
 **Known gaps at close.** Shared admin token until JWT (M11);
 synchronous persist/publish; no batch or canary endpoints; no
 `ml.model_metadata` mirror; earlier carry-overs.
+
+## Milestone 6 — OpenTelemetry and observability stack (2026-09-20, tag `milestone-6`)
+
+**Built.** `amel_common.telemetry` + trace-correlated logging; OTel
+instrumentation in inference_api, source_simulator, stream_ingestor,
+the DB engine, feast-server (auto) and Airflow (native); OTel Collector
+→ Tempo / Loki / spanmetrics → Prometheus (+ kafka-exporter); Grafana
+with Prometheus, Tempo, Loki and Postgres datasources, trace↔log links
+and an 11-panel dashboard; `make smoke-tracing`.
+
+**Acceptance and proof.** `make smoke-tracing`: one prediction →
+trace `90eb3fe2…` returned as `X-Trace-Id`, **13 spans across
+`inference_api` and `feast_server`** in Tempo (server → httpx client →
+feast server → Redis `HMGET`; `INSERT amel`; `predictions.v1 send`),
+**1 Loki log line** with the id, **1 `ml.predictions` row** with the id,
+6 Prometheus targets up, span-derived RED metrics for 5 services,
+consumer-lag metric present. Airflow DAG-run traces (19.3 s, 444.5 s)
+in Tempo. Observability footprint **≈ 0.9 GB** (all capped); whole
+stack ≈ 9.0 GB of 15. 89 unit tests, ruff/mypy clean.
+
+**Decisions.** ADR-0008 (single collector; logs via stdlib → OTLP;
+response id = trace id; feast-server auto-instrumented; spanmetrics;
+Postgres as a Grafana datasource; linked consumer spans; caps and 24 h
+retention).
+
+**Bugs found and fixed.** Tempo 3 retention keys (CLI flag now); Airflow
+speaks gRPC regardless of protocol env (port 4317); API trace id was a
+minted uuid, not the OTel id; expectation of one trace per Kafka
+message (semantics, documented).
+
+**Known gaps at close.** Third-party container logs not in Loki; no
+alert rules; anonymous Grafana; Redis growth with the simulator; earlier
+carry-overs.

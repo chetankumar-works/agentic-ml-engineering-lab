@@ -324,3 +324,43 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
   left stale from the failed attempt.
 - **Lesson**: a cached-model design only pays off if the *refresh* path
   also fails fast; client library defaults assume you want to wait.
+
+## Milestone 6 — OpenTelemetry and observability
+
+### Tempo 3 refused the retention config
+- **What happened**: `field compactor not found`, then `field
+  block_retention not found`.
+- **Root cause**: Tempo 3.x moved compaction/retention to the
+  backend-scheduler; the YAML keys from every 2.x example are gone.
+- **Fix**: `-backend-scheduler.provider.work.compaction.block-retention=24h`
+  as a CLI flag.
+- **Lesson**: `latest` means "read this version's flags"; `--help` on
+  the binary is the source of truth.
+
+### Airflow's traces never arrived (HTTP/2 "Expected SETTINGS frame")
+- **What happened**: hundreds of `Transient error StatusCode.UNAVAILABLE
+  ... Trying to connect an http1.x server` warnings.
+- **Root cause**: Airflow 3.3 loads the gRPC exporter regardless of
+  `OTEL_EXPORTER_OTLP_PROTOCOL`; the endpoint was the collector's HTTP
+  port.
+- **Fix**: `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317`.
+- **Lesson**: "OTLP" is two wire protocols; check which one a client
+  actually speaks.
+
+### The trace id in the response was not the trace id in Tempo
+- **What happened**: Loki query for the API's `X-Trace-Id` found
+  nothing; Tempo had the trace under a different id.
+- **Root cause**: Milestone 5's `trace_id()` minted a uuid; the OTel
+  instrumentation minted its own trace id; the log processor kept the
+  explicit one.
+- **Fix**: derive `X-Trace-Id` from the active span first.
+- **Lesson**: one id, one source. Anything that mints ids must defer to
+  the tracer once tracing exists.
+
+### Expected one trace per Kafka message
+- **What happened**: the simulator's `send` span and the ingestor's
+  `recv` span were separate traces.
+- **Root cause**: OTel messaging semantics — batch consumers *link* to
+  producer spans rather than parent under them.
+- **Fix**: none needed; documented, and `ingest_batch` spans added.
+- **Lesson**: read the semantic conventions before declaring a bug.

@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from amel_common import telemetry
+
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
@@ -30,6 +32,7 @@ def get_engine() -> Engine:
     global _engine
     if _engine is None:
         _engine = create_engine(get_database_url(), pool_pre_ping=True)
+        telemetry.instrument_sqlalchemy(_engine)  # no-op unless OTEL_ENABLED
     return _engine
 
 

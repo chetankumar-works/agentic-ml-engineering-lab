@@ -7,6 +7,8 @@ from typing import Any
 from amel_common.logging import get_logger
 from confluent_kafka import KafkaError, Producer
 
+from amel_common import telemetry
+
 logger = get_logger(component="producer")
 
 DeliveryCallback = Callable[[str, "KafkaError | None"], None]
@@ -40,6 +42,10 @@ class KafkaEventProducer:
                 "message.timeout.ms": message_timeout_ms,
             }
         )
+        # Each publish opens a producer span and injects traceparent into
+        # the Kafka headers; stream_ingestor's consumer picks it up, so a
+        # feature event is traceable simulator -> Kafka -> ingestor -> Postgres.
+        self._producer = telemetry.instrument_kafka_producer(self._producer)
         self.on_delivery = on_delivery
         self._stop = threading.Event()
         self._poll_thread = threading.Thread(

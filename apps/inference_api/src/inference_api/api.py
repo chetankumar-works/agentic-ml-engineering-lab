@@ -12,6 +12,7 @@ from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from amel_common import telemetry
 from inference_api import metrics
 from inference_api.config import Settings
 from inference_api.service import FeaturesNotFound, ModelNotLoaded, PredictionService
@@ -38,10 +39,15 @@ class RawPredictRequest(BaseModel):
 
 
 def trace_id(x_trace_id: Annotated[str | None, Header()] = None) -> str:
-    """Honour a caller-supplied X-Trace-Id (propagation) or mint one.
-    Module-level on purpose: with `from __future__ import annotations`,
-    FastAPI resolves annotation strings against module globals."""
-    return x_trace_id or uuid.uuid4().hex
+    """The id every log line, DB row and Kafka event for this request
+    carries. Precedence: the active OpenTelemetry trace (a caller's W3C
+    `traceparent` or one started by the FastAPI instrumentation) so the
+    id in the response is the id in Tempo; else a caller-supplied
+    `X-Trace-Id`; else a fresh one. Module-level on purpose: with
+    `from __future__ import annotations`, FastAPI resolves annotation
+    strings against module globals."""
+    otel_trace_id, _ = telemetry.current_trace_ids()
+    return otel_trace_id or x_trace_id or uuid.uuid4().hex
 
 
 class Probes:

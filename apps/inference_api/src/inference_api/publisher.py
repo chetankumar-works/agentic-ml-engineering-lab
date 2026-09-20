@@ -14,6 +14,8 @@ from amel_common.logging import get_logger
 from amel_common.schemas import PredictionEvent
 from confluent_kafka import Producer
 
+from amel_common import telemetry
+
 logger = get_logger(component="publisher")
 
 
@@ -29,6 +31,9 @@ class PredictionPublisher:
                 "message.timeout.ms": 30_000,
             }
         )
+        # traceparent goes into the message headers, so a consumer of
+        # predictions.v1 joins the same trace as the /predict request.
+        self._producer = telemetry.instrument_kafka_producer(self._producer)
         self.delivery_failures = 0
         self.last_delivery_error: str | None = None
         self.last_delivery_error_at: float | None = None

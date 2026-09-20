@@ -123,6 +123,16 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://amel:amel_dev_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      # Airflow 3 ships its own OpenTelemetry integration: DAG-run and
+      # task spans to the same collector (Milestone 6).
+      AIRFLOW__TRACES__OTEL_ON: "true"
+      # Airflow 3.3 reads the standard OTel env vars; [traces] otel_host/
+      # otel_port are legacy backcompat.
+      # Airflow's exporter selection ignores OTEL_EXPORTER_OTLP_PROTOCOL and
+      # uses gRPC, so point it at the collector's gRPC receiver (4317).
+      OTEL_SERVICE_NAME: airflow
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_TRACES_EXPORTER: otlp
       # AMEL's own database (not Airflow's metadata DB) — read by DAG tasks via amel_db.
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
       S3_ENDPOINT_URL: http://minio:9000
@@ -154,6 +164,8 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DATA_DIR: /data
       HIGGS_MAX_ROWS: ${HIGGS_MAX_ROWS:-500000}
@@ -187,6 +199,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
     ports:
@@ -224,7 +238,17 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-    command: ["feast", "serve", "--host", "0.0.0.0", "--port", "6566", "--no-access-log"]
+    # `opentelemetry-instrument` auto-instruments Feast's FastAPI app and
+    # its redis client, so /predict/entity traces continue into
+    # feast-server -> Redis (Milestone 6).
+    command: ["opentelemetry-instrument", "feast", "serve", "--host", "0.0.0.0", "--port", "6566", "--no-access-log"]
+    environment:
+      OTEL_SERVICE_NAME: feast_server
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
     ports:
       - "6566:6566"
     mem_limit: 1g
@@ -292,6 +316,8 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
+      OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
       INFERENCE_MLFLOW_TRACKING_URI: http://mlflow:5000
       INFERENCE_FEAST_SERVER_URL: http://feast-server:6566
@@ -312,6 +338,87 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+
+  # --- Observability (Milestone 6, DECISIONS.md ADR-0008) -------------------
+  # Every first-party service sends OTLP to the collector; Prometheus
+  # scrapes /metrics directly. All five are memory-capped and keep 24h.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    ports:
+      - "4318:4318"   # OTLP/HTTP from host-run tools (optional)
+    mem_limit: 256m
+
+  tempo:
+    image: grafana/tempo:latest
+    command:
+      - "-config.file=/etc/tempo.yaml"
+      - "-backend-scheduler.provider.work.compaction.block-retention=24h"
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API (scripts/smoke_milestone6.py, debugging)
+    mem_limit: 512m
+
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"   # Loki HTTP API (scripts/smoke_milestone6.py, debugging)
+    mem_limit: 512m
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2d"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    mem_limit: 512m
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command: ["--kafka.server=kafka:9092"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 64m
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ADMIN_PASSWORD: amel_dev_password
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    ports:
+      - "3000:3000"
+    mem_limit: 256m
 
   # One-shot training run (Milestone 4): `make train`, `make promote`.
   train:
@@ -370,6 +477,10 @@ services:
     mem_limit: 2g
 
 volumes:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
   postgres-data:
   kafka-data:
   minio-data:

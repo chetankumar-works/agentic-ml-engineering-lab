@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -62,3 +62,8 @@ promote:             # explicit, audited candidate -> champion (fails with exit 
 
 model-show:          # current candidate/champion from the registry
 	$(COMPOSE) --profile train run --rm train show
+
+# --- Observability (Milestone 6) ---
+
+smoke-tracing:       # one prediction traced end to end: response -> Tempo -> Loki -> Postgres
+	uv run python scripts/smoke_milestone6.py

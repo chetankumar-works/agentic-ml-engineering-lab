@@ -44,11 +44,13 @@ from confluent_kafka import Consumer, KafkaError, KafkaException, Message, Topic
 from pydantic import ValidationError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from amel_common import telemetry
 from stream_ingestor import metrics
 from stream_ingestor.config import Settings
 from stream_ingestor.dlq import DlqProducer
 
 logger = get_logger(component="consumer")
+tracer = telemetry.trace.get_tracer("stream_ingestor")
 
 
 class StreamIngestor:
@@ -63,13 +65,15 @@ class StreamIngestor:
         self._thread: threading.Thread | None = None
         # `consumer` is injectable so the loop/probe logic is unit-testable
         # without a broker (tests/test_probes.py).
-        self._consumer = consumer or Consumer(
-            {
-                "bootstrap.servers": settings.kafka_bootstrap_servers,
-                "group.id": settings.consumer_group,
-                "enable.auto.commit": False,
-                "auto.offset.reset": "earliest",
-            }
+        self._consumer = consumer or telemetry.instrument_kafka_consumer(
+            Consumer(
+                {
+                    "bootstrap.servers": settings.kafka_bootstrap_servers,
+                    "group.id": settings.consumer_group,
+                    "enable.auto.commit": False,
+                    "auto.offset.reset": "earliest",
+                }
+            )
         )
         self._consumer.subscribe(
             [settings.features_topic, settings.labels_topic],
@@ -163,6 +167,17 @@ class StreamIngestor:
         return batch
 
     def _process_batch(self, batch: list[Message]) -> None:
+        # One span per batch (the DB transaction is per batch); the
+        # instrumented consumer already opened a span per message with the
+        # producer's trace context, so a single feature event shows up as
+        # simulator publish -> ingestor receive, and the batch write is
+        # visible as its own unit of work.
+        with tracer.start_as_current_span(
+            "ingest_batch", attributes={"messaging.batch.message_count": len(batch)}
+        ):
+            self._process_batch_inner(batch)
+
+    def _process_batch_inner(self, batch: list[Message]) -> None:
         metrics.BATCH_SIZE.observe(len(batch))
         features_rows: list[dict[str, Any]] = []
         labels_rows: list[dict[str, Any]] = []
