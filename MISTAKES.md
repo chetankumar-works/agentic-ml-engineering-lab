@@ -364,3 +364,31 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
   producer spans rather than parent under them.
 - **Fix**: none needed; documented, and `ingest_batch` spans added.
 - **Lesson**: read the semantic conventions before declaring a bug.
+
+## Milestone 7 — Docker hardening + CI/CD
+
+### On a clean checkout the DAG never ran
+- **What happened**: `airflow dags trigger` returned a run id that stayed
+  `queued`; 0/10 tasks.
+- **Root cause**: Airflow pauses newly discovered DAGs by default; the
+  Milestone 2 stack had been unpaused by hand in the UI and the volume
+  remembered it.
+- **Fix**: `AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false`.
+- **Lesson**: any state that lives in a volume can hide a missing
+  configuration; only a fresh-volume run finds it.
+
+### Stale GitHub Action pins failed the first two CI runs
+- **What happened**: `Unable to resolve action aquasecurity/trivy-action@0.28.0`,
+  then `astral-sh/setup-uv@v10`.
+- **Root cause**: guessed versions; `setup-uv`'s floating major is `v7`
+  while its releases are `v10.x`.
+- **Fix**: pinned from each repo's tag list (`gh api .../tags`).
+- **Lesson**: look up action versions the same way as any dependency.
+
+### Trivy flagged CVEs in code we never ship
+- **What happened**: 4 CRITICAL findings, all in
+  `.venv/.../feast/ui/yarn.lock`.
+- **Root cause**: the scan walked the virtualenv; Feast bundles a JS UI
+  lockfile we do not run.
+- **Fix**: `skip-dirs: .venv`; scan `uv.lock` (0 CRITICAL).
+- **Lesson**: scope a scanner to what you ship, then keep it strict.

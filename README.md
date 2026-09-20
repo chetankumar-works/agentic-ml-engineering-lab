@@ -19,9 +19,10 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 6 (OpenTelemetry in every first-party service, Collector →
-Tempo/Loki/Prometheus, Grafana dashboards; one id links a prediction's
-response, trace, logs and DB row) on top of Milestone 5's FastAPI
+Milestone 7 (hardened Compose stack — pinned images, non-root, restart
+policies; GitHub Actions CI with SHA-tagged images on GHCR and an
+integration job on a synthetic dataset; clean checkout proven end to
+end) on top of Milestone 6's observability stack, Milestone 5's FastAPI
 inference API, Milestone 4's reproducible training + MLflow
 registry, Milestone 3's Feast/Redis feature store, Milestone
 2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
@@ -80,7 +81,29 @@ system's default `python3`. `uv` reads it automatically.
 The source simulator downloads the ~2.8GB UCI HIGGS dataset zip on first
 start (see `services/source_simulator/src/source_simulator/dataset.py`)
 and caches it under `./data/raw/` (bind-mounted, gitignored) — this takes
-a while on a slow connection but only happens once.
+a while on a slow connection but only happens once. For a quick start
+(or CI), generate a small synthetic stand-in with the same packaging
+instead: `uv run python scripts/make_synthetic_higgs.py` — the whole
+stack, including training, runs on it.
+
+## Clean checkout, start to finish
+
+```bash
+git clone https://github.com/chetankumar-works/agentic-ml-engineering-lab.git amel && cd amel
+make install
+uv run python scripts/make_synthetic_higgs.py     # or drop the real higgs.zip into data/raw/
+make up                                            # ~3 min first time; 20 containers, ~7 GB RAM
+SMOKE_MIN_FEATURE_EVENTS=5000 make smoke           # ingestion
+docker exec amel-airflow-1 airflow dags trigger higgs_pipeline   # or wait for the */5 schedule
+make feast-demo                                    # after the first DAG run with data
+make train && DECIDED_BY=$USER make promote        # first champion
+curl -X POST localhost:8003/model/refresh -H 'X-Admin-Token: dev-admin-token'
+make smoke-tracing                                 # one prediction, traced end to end
+```
+
+CI: `.github/workflows/ci.yml` runs on every push/PR (lint, format,
+mypy, tests, compose config, Trivy, 8 image builds, an integration run
+on the synthetic dataset); images land on GHCR tagged with the commit SHA.
 
 ## Repository layout
 

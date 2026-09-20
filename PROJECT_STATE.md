@@ -7,129 +7,105 @@ clean stopping point mid-milestone) per the Definition of Done in
 
 ## Current milestone
 
-**Milestone 6 — OpenTelemetry and observability stack.** Complete.
+**Milestone 7 — Docker hardening + CI/CD.** Complete.
 
-## Completed work (Milestone 6; earlier milestones in MILESTONE_REPORT.md)
+## Completed work (Milestone 7; earlier milestones in MILESTONE_REPORT.md)
 
-- **`amel_common.telemetry`**: `configure_telemetry()` (tracer + logger
-  providers, OTLP/HTTP export, resource attrs), `instrument_fastapi/
-  sqlalchemy/httpx/kafka_producer/kafka_consumer`, `current_trace_ids()`.
-  Opt-in via `OTEL_ENABLED` (Compose sets it; tests never need a
-  collector).
-- **`amel_common.logging`** now routes structlog through stdlib so the
-  OTLP `LoggingHandler` ships every line with `trace_id`/`span_id`.
-- **Instrumented**: `inference_api` (FastAPI, httpx→feast-server,
-  SQLAlchemy, Kafka producer; `X-Trace-Id` = OTel trace id),
-  `source_simulator` (FastAPI, Kafka producer), `stream_ingestor`
-  (FastAPI, Kafka consumer + `ingest_batch` spans, SQLAlchemy),
-  `amel_db` engine, **feast-server** (`opentelemetry-instrument`),
-  **Airflow** (native OTel, gRPC).
-- **Infra** (`infra/observability/`): OTel Collector 0.161 (traces →
-  Tempo, logs → Loki OTLP, `spanmetrics` → Prometheus exporter), Tempo
-  3.0, Loki 3.7, Prometheus 3.14 (+ kafka-exporter 1.10 for consumer
-  lag), Grafana 13.2 provisioned with Prometheus/Tempo/Loki/AMEL
-  Postgres datasources, trace↔logs links, and the "AMEL overview"
-  dashboard (11 panels). All capped; 24 h / 2 d retention.
-- **`scripts/smoke_milestone6.py`** / `make smoke-tracing`.
-- `DECISIONS.md` ADR-0008; docs updated. 89 unit tests (unchanged —
-  telemetry is off under test).
+- **Compose hardening**: every image tag pinned (MinIO
+  `RELEASE.2025-09-07T16-13-09Z` / mc `RELEASE.2025-08-13T08-35-41Z`,
+  Tempo 3.0.0, Loki 3.7.8, Prometheus v3.14.0, Grafana 13.2.2,
+  kafka-exporter v1.10.0, collector 0.161.0); `restart: unless-stopped`
+  on all 16 long-running services; healthchecks on Prometheus and
+  Grafana (Tempo/Loki/collector are distroless — documented); non-root
+  `USER` in feast, training, migrate and mlflow images (all first-party
+  images now non-root); tighter `.dockerignore`;
+  `AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false`.
+- **`scripts/make_synthetic_higgs.py`**: synthetic `HIGGS.csv.gz`-in-zip
+  with the real packaging; streamed by the simulator unchanged (test).
+- **`.github/workflows/ci.yml`**: quality (ruff, format, mypy, pytest) ·
+  compose config · Trivy CRITICAL on `uv.lock` · 8 image builds
+  (`ghcr.io/chetankumar-works/agentic-ml-engineering-lab/<image>:<sha>`,
+  pushed on main/tags) · integration (Postgres + Kafka + simulator +
+  ingestor on the synthetic archive → M1 smoke → probes).
+- `DECISIONS.md` ADR-0009; docs updated. 89 → **90 unit tests**.
 
-## Milestone 6 acceptance run
-
-Run 2026-09-20 against the live stack (`make smoke-tracing`, plus
-manual checks).
+## Milestone 7 acceptance run
 
 ```
-=== 1. prediction ===
-  entity higgs-001600326 -> prediction 1 (model v5)
-  trace 90eb3fe29dfa1467e2262db765be6e6f          (== X-Trace-Id response header)
-=== 2. Tempo: the trace spans two services ===
-  13 spans across ['feast_server', 'inference_api']
-     inference_api SERVER  POST /predict/entity/{entity_id}
-     inference_api CLIENT  POST                       -> feast_server SERVER POST /get-online-features
-     feast_server  CLIENT  HMGET (Redis)
-     inference_api CLIENT  INSERT amel (ml.predictions)
-     inference_api PRODUCER predictions.v1 send
-=== 3. Loki: a log line carries the trace id ===   1 line ({"event": "prediction_request", "trace_id": ...})
-=== 4. Postgres: the ml.predictions row carries it ===   1 row
-=== 5. Prometheus ===  6 targets up; RED (spanmetrics) for airflow, feast_server, inference_api,
-                       source_simulator, stream_ingestor; kafka_consumergroup_lag{stream-ingestor} present
-Milestone 6 smoke test PASSED
+Clean checkout (2026-09-20, main stack stopped, fresh clone into a scratch dir,
+COMPOSE_PROJECT_NAME=amelclean => fresh volumes):
+  git clone + make install            1.5 s (cached uv)
+  make_synthetic_higgs --rows 20000   2,111,682 bytes
+  make up                             2 m 41 s; 20 containers; init scripts created airflow/feast/mlflow;
+                                      alembic 0005; 9 fresh volumes
+  inference-api before any model      /health 200, /ready 503 "no model loaded: ... not found"  (honest)
+  make smoke (min 5000)               5,391 rows / 5,391 distinct; DLQ 15 + 17  PASSED
+  DAG (after unpausing — bug found)   78,432 curated rows; update_feature_store windows=4; Redis 78,432
+  make feast-demo                     PASSED (20/20 features; 0/20 leaked; online 5/5)
+  make train                          v1, test_accuracy 0.7879 (synthetic data), fingerprint a76d1d495856d691
+  make promote                        PROMOTED (first champion)
+  POST /model/refresh                 {"previous_version":null,"current_version":"1","swapped":true}
+  /ready                              200 ready
+  make smoke-tracing                  PASSED (after fixing a ~30 s span-metrics race)
+  memory                              ≈ 7.0 GiB for the whole stack
+  teardown                            down -v; 0 amelclean volumes left
 
-Ingestion: simulator `higgs.features.v1 send` producer spans; ingestor `recv` spans linked to them
-           + `ingest_batch` spans (OTel batch-consumer semantics, ADR-0008).
-Airflow:   `dag_run.higgs_pipeline` root traces (19.3 s and 444.5 s) with task spans, via gRPC.
-Grafana:   all 4 datasources healthy; dashboard loads; Postgres panel returns ml.predictions count.
-Memory:    collector 129 MiB, Tempo 279, Loki 124, Prometheus 139, Grafana 191, kafka-exporter 30
-           (≈ 0.9 GB); all containers ≈ 9.0 GB of 15.
+GitHub Actions (run 35531470319, main, 2026-09-20 19:11 -> 19:14, success):
+  quality 48 s · compose config 7 s · trivy 12 s (uv.lock: 0 CRITICAL) ·
+  8 image builds 18–40 s each (GHA cache) pushed to GHCR by SHA ·
+  integration 1 m 54 s: M1 smoke 5,738 rows / 0 duplicates / DLQ 26 + 40, /ready 200 on both services
+  (two earlier runs failed on stale action pins — fixed)
 ```
 
-**Milestone 6 acceptance verified**: a single prediction is traced
-across service boundaries (inference_api → feast_server → Redis, plus
-Postgres and Kafka), with logs, metrics and the DB row correlated on one
-id.
+**Milestone 7 acceptance verified**: a clean checkout starts the local
+environment with the documented commands (README "Clean checkout, start
+to finish"), and GitHub Actions passes on the pushed branch.
 
 ## Verified tool versions (WSL2, Ubuntu 26.04 LTS "resolute")
 
-Unchanged from Milestone 0–5 (re-verify at the start of Milestone 7) —
+Unchanged from Milestone 0–6 (re-verify at the start of Milestone 8) —
 see git history for the full table. Additions this milestone:
 `opentelemetry-sdk 1.44.0` / instrumentations `0.65b0`; images
 `otel/opentelemetry-collector-contrib:0.161.0`, `grafana/tempo` 3.0.0,
 `grafana/loki` 3.7.8, `prom/prometheus` 3.14.0, `grafana/grafana` 13.2.2,
-`danielqsj/kafka-exporter` 1.10.0 (the `latest` tags resolved to these on
-2026-09-20 — pin in Milestone 7).
+`danielqsj/kafka-exporter` 1.10.0 — all pinned in Compose as of Milestone 7. GitHub Actions: `actions/checkout@v7`,
+`astral-sh/setup-uv@v7`, `aquasecurity/trivy-action@v0.36.0`,
+`docker/build-push-action@v7`, `docker/setup-buildx-action@v4`,
+`docker/login-action@v4`.
 
 ## Current known failures / gaps
 
-- Only first-party Python logs reach Loki; Kafka/Postgres/MinIO/Airflow
-  container logs are `docker logs` only (Alloy/Promtail is the upgrade,
-  planned with Kubernetes in Milestone 8).
-- Kafka consumer spans are linked, not parented (by design); an
-  end-to-end "one trace per event" view needs a different pattern.
-- No alert rules; Grafana is anonymous-admin (dev only); one dashboard.
-- Airflow ignores `OTEL_EXPORTER_OTLP_PROTOCOL` (gRPC only).
-- Redis keeps growing with the simulator (~200 MB/h of new entities at
-  100 events/s; 0.8 GB at 1.6 M) — consider `key_ttl_seconds` on the
-  Feast online store or pausing the simulator when idle.
+- CI's integration job covers ingestion only (runner memory); Feast/
+  MLflow/inference are proven by the manual clean-checkout run.
+- Images are `linux/amd64` only; Trivy scans the lockfile, not images.
+- Tempo/Loki/collector have no in-image healthcheck (distroless).
+- The clean-checkout procedure is manual (documented in README/
+  LEARNING_LOG); a scripted `make clean-checkout-test` is a candidate.
 - Carried: shared admin token; synchronous persist/publish; promotion
-  on own test split; manual DB creation on existing volumes; simulator
-  position manual; no CI (Milestone 7); no dedicated ingestor failure
-  script.
+  on own test split; simulator position manual; Redis growth; third-
+  party container logs not in Loki; no alert rules.
 
 ## Commands that work today
 
 ```bash
-make install       # uv sync --all-packages
-make lint / fmt / typecheck / test   # 89 tests, no infra
-
-make up             # everything incl. otel-collector, tempo, loki, prometheus, kafka-exporter, grafana
-make logs / make down
+make install · make lint / fmt / typecheck / test (90 tests)
+uv run python scripts/make_synthetic_higgs.py   # synthetic dataset for a quick or clean start
+make up / logs / down
 make smoke · make feast-materialize · make feast-demo · make failure-simulator-wedge
-make train · make promote DECIDED_BY=you · make model-show
-make smoke-tracing  # Milestone 6 acceptance
-
-# UIs: Grafana http://localhost:3000 · Prometheus :9090 · Tempo :3200 · Loki :3100
-#      MLflow :5000 · Airflow :8080 · inference API :8003/docs
-curl -s "localhost:3200/api/traces/<trace_id>"
-curl -s -G localhost:3100/loki/api/v1/query_range --data-urlencode 'query={service_name="inference_api"} |= "<trace_id>"'
-curl -s -G localhost:9090/api/v1/query --data-urlencode 'query=sum by (service_name) (traces_span_metrics_calls_total)'
+make train · make promote DECIDED_BY=you · make model-show · make smoke-tracing
+gh run list --limit 3 · gh run watch <id>
+# Clean checkout: README "Clean checkout, start to finish"
 ```
 
 ## Next task
 
-**Milestone 7 — Docker hardening + CI/CD.**
-
-Acceptance: a clean checkout can start the local environment using
-documented commands, and GitHub Actions passes on the pushed branch.
-Concretely: (1) prove the clean-checkout path — fresh clone, `make
-install`, `make up` on an empty volume set (the init scripts must create
-`airflow`/`feast`/`mlflow` DBs; the simulator must fetch the dataset or
-be pointed at a cached copy), `make smoke`, `make feast-materialize`,
-`make train`; (2) Docker hardening: non-root users where missing
-(feast/training/mlflow images run as root), pinned base images and
-image tags (`latest` → versions verified this milestone), `.dockerignore`,
-healthchecks on every long-running service, restart policies, resource
-caps everywhere; (3) GitHub Actions: lint + typecheck + unit tests on
-push/PR, image builds, and a lightweight integration job if feasible
-within runner limits; (4) update MILESTONE_REPORT/ARCHITECTURE. The
-kind/minikube memory plan is due *before* Milestone 8.
+**Milestone 8 — Kubernetes.** BLOCKED ON A DECISION: present the
+kind/minikube memory plan to the developer before starting (their
+explicit instruction). Acceptance: core stateless services run on
+kind/minikube with health probes and configuration separation.
+Candidates for "core stateless": inference-api, feast-server,
+source-simulator, stream-ingestor (Postgres/Kafka/Redis/MinIO/MLflow
+stay in Compose, reached from the cluster via the host). Manifests
+under `infra/k8s/`, validated in CI with `kubeconform`; ConfigMaps/
+Secrets for configuration; liveness/readiness probes on the honest
+`/health` and `/ready` endpoints built in Milestones 3 and 5.

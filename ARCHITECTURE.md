@@ -107,7 +107,7 @@ to record.
 
 ## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
 
-Three views, all of what is **built** as of Milestone 6 unless a node is
+Three views, all of what is **built** as of Milestone 7 unless a node is
 marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
 
 ### System context
@@ -248,12 +248,16 @@ flowchart LR
         m6c["Collector · Tempo · Loki<br/>Prometheus · Grafana"]
         m6d["make smoke-tracing"]
     end
-    subgraph next ["M7+ (planned)"]
+    subgraph M7 ["M7 — hardening + CI"]
+        m7a["pinned images · restart · healthchecks<br/>non-root · .dockerignore"]
+        m7b["scripts/make_synthetic_higgs.py"]
+        m7c["GitHub Actions: quality · compose<br/>trivy · 8 images → GHCR · integration"]
+    end
+    subgraph next ["M8+ (planned)"]
         m5["platform_api"]
-        m7["Docker hardening + CI"]
         m8["Kubernetes"]
     end
-    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> next
+    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> next
 ```
 
 
@@ -429,6 +433,9 @@ during each acceptance run, and what was actually verified:
   prediction's response, its spans across services (Tempo), its log
   lines (Loki) and its database row; proven repeatably by
   `make smoke-tracing`.
+- **Reproducible environment** (Milestone 7): pinned image tags, a
+  lockfile, non-root images, and a clean-checkout run proven on fresh
+  volumes; CI validates every push and builds SHA-tagged images.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 

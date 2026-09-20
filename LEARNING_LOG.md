@@ -990,3 +990,80 @@ parented — one poll can carry many producers' traces), and
   span?"
 - "What does an OTel Collector give you over exporting directly?"
 - "What would you cap or sample first if this ran at 100× the volume?"
+
+## Milestone 7 — Docker hardening + CI/CD
+
+**WHAT WAS BUILT.** Compose hardening (pinned tags, restart policies,
+healthchecks, non-root images, `.dockerignore`), a synthetic HIGGS
+archive generator, and `.github/workflows/ci.yml` (quality, compose
+config, Trivy, 8 image builds pushed to GHCR by SHA on `main`, and an
+integration job that ingests the synthetic archive end to end).
+ADR-0009.
+
+**WHY IT EXISTS.** Everything before this milestone worked *on this
+machine, on volumes with history*. "A clean checkout starts with the
+documented commands" is the first claim that a stranger can verify, and
+CI is the mechanism that keeps it true after every commit.
+
+**WHAT THE CLEAN RUN LOOKED LIKE.** `git clone` → `make install`
+(1.5 s, cached) → synthetic archive (20k rows, 2 MB) → `make up` under
+a fresh Compose project (2 m 41 s, 20 containers, `airflow`/`feast`/
+`mlflow` databases created by the init scripts, Alembic at 0005) →
+inference API honestly **not ready** (`no model loaded: Registered Model
+… not found`) → M1 smoke (5,391 rows, 15 + 17 DLQ) → DAG run (78,432
+curated rows, 4 materialize windows, Redis = curated) → `make feast-demo`
+passes → `make train` (v1, test accuracy 0.79 on synthetic data) →
+`make promote` → `POST /model/refresh` (`null → 1`) → ready → `make
+smoke-tracing` passes. Peak ≈ 7 GB for the whole stack.
+
+**WHAT CI DOES ON EVERY PUSH.** 12 jobs, ~3 minutes: quality gate;
+`docker compose config`; Trivy on `uv.lock` (0 CRITICAL); 8 image
+builds with GHA layer cache, labelled with the commit SHA and source
+repo, pushed to `ghcr.io/chetankumar-works/agentic-ml-engineering-lab/
+<image>:<sha>`; and the integration job — Postgres, Kafka, `kafka-init`,
+`migrate`, simulator at 500 events/s, ingestor — which passed the M1
+smoke at 5,738 rows / 0 duplicates / 26 + 40 DLQ messages and checked
+`/ready` on both services.
+
+**IMPORTANT CODE FILES.**
+- `.github/workflows/ci.yml` — read the `integration` job.
+- `scripts/make_synthetic_higgs.py` and its test.
+- `infra/docker-compose.yml` — the pins, `restart:`, healthchecks.
+- `infra/*/Dockerfile`, `apps/*/Dockerfile` — `USER` lines.
+- `DECISIONS.md` ADR-0009.
+
+**FAILURE MODES (exercised).**
+- Fresh Airflow pauses new DAGs → `AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false`.
+- Tracing smoke raced span-metrics on a fresh stack → wait up to 90 s.
+- Three stale GitHub Action pins (`trivy-action@0.28.0`, `setup-uv@v10`)
+  → resolved from the repos' tag lists.
+- Trivy flagged Feast's bundled UI `yarn.lock` inside `.venv` →
+  `skip-dirs: .venv`; our own `uv.lock` has 0 CRITICAL.
+
+**HOW TO TEST IT.**
+- `gh run list` / `gh run watch`; images at GHCR.
+- Clean checkout, locally: `make down`; `git clone <repo> /tmp/clean &&
+  cd /tmp/clean && make install && uv run python
+  scripts/make_synthetic_higgs.py && COMPOSE_PROJECT_NAME=amelclean make
+  up` … `COMPOSE_PROJECT_NAME=amelclean docker compose -f
+  infra/docker-compose.yml down -v`.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Reproducibility of *environments* (pins, lockfiles, fresh volumes) vs
+  of *runs* (Milestone 4).
+- Why CI needs a stand-in dataset and what the stand-in must preserve
+  (the packaging contract, not the physics).
+- Image provenance: SHA tags and OCI labels as the link from a running
+  container back to a commit.
+- Least privilege in images (`USER`), and what breaks when a process
+  needs to write.
+- Distroless images: fewer CVEs, no in-container healthcheck.
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "Your app works on your laptop and nowhere else. What are the first
+  five things you check?"
+- "How do you integration-test a pipeline whose input is a 3 GB
+  download?"
+- "What should a CI pipeline for an ML platform verify on every PR, and
+  what should only happen on main?"
+- "Why pin image tags, and what is the cost?"

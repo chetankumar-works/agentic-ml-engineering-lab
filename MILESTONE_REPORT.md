@@ -305,3 +305,34 @@ message (semantics, documented).
 **Known gaps at close.** Third-party container logs not in Loki; no
 alert rules; anonymous Grafana; Redis growth with the simulator; earlier
 carry-overs.
+
+## Milestone 7 — Docker hardening + CI/CD (2026-09-20, tag `milestone-7`)
+
+**Built.** Pinned image tags, restart policies, healthchecks, non-root
+users in every first-party image, `.dockerignore`, DAGs unpaused at
+creation; `scripts/make_synthetic_higgs.py`; `.github/workflows/ci.yml`
+with quality, compose-config, Trivy, 8 SHA-tagged image builds to GHCR
+and an ingestion integration job on the synthetic archive.
+
+**Acceptance and proof.**
+- **Clean checkout**: fresh clone + fresh volumes → `make up` in
+  2 m 41 s, 20 containers, init scripts created all three extra
+  databases, Alembic at 0005; M1 smoke 5,391/5,391 rows; DAG curated
+  78,432 rows and materialized 4 windows; Feast demo passed; trained
+  v1 (0.7879 on synthetic data), promoted, refreshed → `/ready` 200;
+  tracing smoke passed; ≈ 7.0 GiB peak.
+- **GitHub Actions**: run `35531470319` on `main` **success** in 3 m
+  07 s — 12 jobs; Trivy 0 CRITICAL in `uv.lock`; integration job M1
+  smoke 5,738 rows / 0 duplicates / DLQ 26 + 40, probes 200.
+- 90 unit tests, ruff/mypy clean.
+
+**Decisions.** ADR-0009 (no `latest`; synthetic dataset as the CI
+contract; SHA-tagged images; real clean-checkout run as the proof).
+
+**Bugs found and fixed.** Fresh Airflow pauses new DAGs; tracing smoke
+raced span metrics; two stale GitHub Action pins; Trivy scanning
+Feast's bundled UI lockfile in `.venv`.
+
+**Known gaps at close.** CI integration covers ingestion only; amd64
+only; lockfile-only scanning; no in-image healthcheck for distroless
+images; clean-checkout run is manual.

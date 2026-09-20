@@ -540,3 +540,57 @@ Kubernetes log collection in Milestone 8; alert rules once the platform
 event model (Milestone 11) defines what an incident is; OTel metrics
 export from the SDK if `/metrics` scraping becomes awkward under
 Kubernetes.
+
+## ADR-0009: CI on GitHub Actions with a synthetic-dataset integration job; images tagged by commit SHA; `latest` tags banned
+
+**Problem.** Milestone 7 needed a clean checkout to start with documented
+commands, and CI that validates every push and builds deployable images
+— without the 2.8 GB HIGGS download and within a 7 GB runner.
+
+**Decision.**
+1. **Pinned image tags everywhere.** Every `latest` in Compose became
+   the exact version verified on 2026-09-20 (MinIO release tags, Tempo
+   3.0.0, Loki 3.7.8, Prometheus v3.14.0, Grafana 13.2.2, kafka-exporter
+   v1.10.0). `restart: unless-stopped` on all 16 long-running services;
+   healthchecks wherever the image has a shell (Tempo/Loki/collector are
+   distroless — documented); non-root users in every first-party image.
+2. **A synthetic HIGGS archive** (`scripts/make_synthetic_higgs.py`:
+   `HIGGS.csv.gz` inside a zip, no header, label + 28 floats) stands in
+   for the real one in CI and in clean-checkout runs; the simulator reads
+   it through the same code path (tested).
+3. **One workflow, five kinds of job**: quality (ruff, format, mypy,
+   pytest), compose config validation, Trivy CRITICAL scan of `uv.lock`
+   (`.venv` skipped — Feast's bundled UI lockfile carries JS CVEs we
+   don't ship), a matrix build of the 8 first-party images tagged
+   `ghcr.io/<repo>/<image>:<sha>` and `:<ref>` (pushed only on `main`/
+   tags), and an **integration job** that runs Postgres + Kafka +
+   simulator + ingestor on the synthetic archive and executes the
+   Milestone 1 smoke test with a reduced threshold. Nothing deploys.
+4. **Clean-checkout proof is a real run, not a claim**: fresh `git
+   clone`, `make install`, synthetic archive, `make up` under a new
+   Compose project name (fresh volumes) with the main stack stopped, then
+   the whole path through `make smoke-tracing`.
+
+**Reason.**
+1. `latest` moved under us twice already (MinIO off Docker Hub; Tempo 3
+   config keys). A pin is a fact; `latest` is a hope.
+2. The real dataset is the one thing a fresh machine cannot get
+   reliably; the packaging is the only contract the simulator depends on.
+3. Runners have ~7 GB; the ingestion slice is ~2.5 GB and finishes in
+   ~2 min. Building images in CI is what makes "deployable images from
+   main" true; the SHA tag is the traceability the kickoff asks for.
+4. The clean run found two real defects the developer's own stack had
+   masked: fresh Airflow pauses new DAGs (the trigger sat `queued`
+   forever), and span-derived metrics lag ~30 s after the first-ever
+   prediction (the tracing smoke raced them).
+
+**Tradeoffs.** CI does not exercise Feast/MLflow/inference (memory and
+time on a shared runner); the clean-checkout run does, by hand, per
+milestone. GHCR images are built for `linux/amd64` only. Trivy ignores
+unfixed CVEs and HIGH severity.
+
+**Future reconsideration trigger.** Add a Kubernetes manifest validation
+job in Milestone 8 (`kubeconform`); extend the integration job to
+Feast + inference if a larger runner becomes available; add image
+scanning (not just lockfile) once images are pulled from GHCR by
+Kubernetes.

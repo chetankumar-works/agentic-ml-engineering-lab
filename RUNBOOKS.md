@@ -422,3 +422,20 @@ group** for an hour.
   (`--storage.tsdb.retention.time`, Tempo/Loki 24 h flags/config),
   raise the collector's `memory_limiter`, or `docker compose stop
   grafana` when not looking at dashboards.
+
+## CI is red
+
+- Read the job first: `gh run list --limit 3`, `gh run view <id>`,
+  `gh run view --job <job-id> --log | tail -50`.
+- `quality`: reproduce with `make lint fmt typecheck test`.
+- `security` (Trivy CRITICAL on `uv.lock`): `docker run --rm -v "$PWD":/src
+  aquasec/trivy fs --scanners vuln --severity CRITICAL --ignore-unfixed
+  --skip-dirs /src/.venv /src`; fix by bumping the dependency in
+  `pyproject.toml` + `uv lock`. Never loosen the severity to go green.
+- `integration`: reproduce locally with the synthetic archive
+  (`scripts/make_synthetic_higgs.py`) and `SMOKE_MIN_FEATURE_EVENTS=5000
+  make smoke`; the job prints the last 100 log lines of every container
+  on failure.
+- `build <image>`: `docker build -f <dockerfile> .` from the repo root.
+- An `Unable to resolve action` error is a stale pin: `gh api
+  repos/<owner>/<action>/tags --jq '.[0:3][].name'`.
