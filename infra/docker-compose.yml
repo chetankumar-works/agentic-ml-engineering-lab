@@ -127,6 +127,9 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://amel:amel_dev_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Fresh Airflow pauses new DAGs; on a clean checkout higgs_pipeline
+      # would sit queued forever (found by the Milestone 7 clean-checkout run).
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
       # Airflow 3 ships its own OpenTelemetry integration: DAG-run and
       # task spans to the same collector (Milestone 6).

@@ -121,9 +121,15 @@ def main() -> int:
     down = [j for j, h in targets.items() if h != "up"]
     assert not down, f"targets down: {down}"
     q = urllib.parse.quote("sum by (service_name) (traces_span_metrics_calls_total)")
-    _, _, b = get(f"{PROM_URL}/api/v1/query?query={q}")
-    svcs = sorted(r["metric"]["service_name"] for r in json.loads(b)["data"]["result"])
-    assert "inference_api" in svcs and "feast_server" in svcs, svcs
+
+    def red_metrics():  # noqa: ANN202
+        # spanmetrics flush every 15 s and Prometheus scrapes every 15 s:
+        # right after the first-ever prediction they can lag ~30 s.
+        _, _, b = get(f"{PROM_URL}/api/v1/query?query={q}")
+        svcs = sorted(r["metric"]["service_name"] for r in json.loads(b)["data"]["result"])
+        return svcs if {"inference_api", "feast_server"} <= set(svcs) else None
+
+    svcs = wait_for("span-derived RED metrics for inference_api + feast_server", red_metrics, 90)
     print(f"  {len(targets)} targets up; RED metrics for {svcs}")
 
     print("\nMilestone 6 smoke test PASSED: one trace id links response, Tempo, Loki and Postgres.")
