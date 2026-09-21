@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feast-server
+  namespace: amel
+  labels: { app: feast-server, app.kubernetes.io/part-of: amel }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: feast-server }
+  template:
+    metadata:
+      labels: { app: feast-server }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }
+      containers:
+        - name: feast-server
+          image: amel-feast-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["opentelemetry-instrument", "feast", "serve", "--host", "0.0.0.0", "--port", "6566", "--no-access-log"]
+          ports: [{ name: http, containerPort: 6566 }]
+          env:
+            - name: OTEL_SERVICE_NAME
+              valueFrom: { configMapKeyRef: { name: amel-config, key: OTEL_SERVICE_NAME_FEAST } }
+          envFrom:
+            - configMapRef: { name: amel-config }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feast-server
+  namespace: amel
+spec:
+  type: NodePort
+  selector: { app: feast-server }
+  ports:
+    - { name: http, port: 6566, targetPort: http, nodePort: 30566 }

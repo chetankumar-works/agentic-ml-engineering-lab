@@ -336,3 +336,40 @@ Feast's bundled UI lockfile in `.venv`.
 **Known gaps at close.** CI integration covers ingestion only; amd64
 only; lockfile-only scanning; no in-image healthcheck for distroless
 images; clean-checkout run is manual.
+
+## Milestone 8 — Kubernetes on kind (2026-09-21, tag `milestone-8`)
+
+**Built.** `infra/k8s/` manifests (namespace, ConfigMap, Secret
+template, 4 Deployments + Services with startup/liveness/readiness
+probes and limits, Ingress, 2 Jobs, kustomization), `make k8s-up/down`
+(kind on the Compose network, 3 GB node cap, ingress-nginx, image
+loading, Secret from env, Airflow re-pointing), a stall watchdog in both
+loop services, 2% trace sampling for the Kafka-heavy services,
+dual-location Prometheus targets, `kubeconform` in CI.
+
+**Acceptance and proof.**
+- All four stateless services `1/1 Running` on kind; Jobs completed;
+  NodePort and Ingress (`amel.localtest.me`) return 200; probes visible
+  in `kubectl describe`; in-cluster ingestion advanced landing from
+  2,100,393 to 2,149,789 rows; Airflow materialized through the
+  in-cluster feast-server; tracing smoke passed against the cluster.
+- **Readiness gates rollouts**: bad MLflow URL → new pod never Ready,
+  old pod kept serving, `rollout undo` restored.
+- **Liveness acts on real stalls**: frozen Postgres → *before* the fix
+  a silent 5-hour hang with `/health` 200; *after* the watchdog
+  `503 consume loop stalled for 67s` → kubelet restarts (3 in ~6 min)
+  → recovery on unpause.
+- **Memory**: node anon 1.44–1.72 GB (cap 3 GB); host 8.1 → 8.9 GB
+  used; Tempo fixed from 113 OOM restarts to 0.
+- 92 unit tests, ruff/mypy clean, kubeconform valid.
+
+**Decisions.** ADR-0010 (kind on the Compose network; only stateless
+services move; node cap; progress-based liveness; head sampling).
+
+**Bugs found and fixed.** Ingress admission webhook race; "alive but
+hung" liveness gap under a frozen database; Tempo OOM loop from 100%
+Kafka spans; Prometheus targets lost on topology change.
+
+**Known gaps at close.** Env keys duplicated across Compose/k8s; modes
+mutually exclusive for moved services; no metrics-server; sampled RED
+for two services; earlier carry-overs.

@@ -162,3 +162,18 @@ def test_start_index_offsets_entity_ids(monkeypatch: pytest.MonkeyPatch) -> None
 
     feature_keys = [key for topic, key in producer.published if topic.startswith("higgs.features")]
     assert feature_keys == ["higgs-000884910", "higgs-000884911"]
+
+
+def test_stalled_loop_fails_liveness_unless_paused() -> None:
+    runner = _runner(stall_timeout_seconds=0.2)
+    runner.ready_event.set()
+    runner._thread = threading.Thread(target=lambda: time.sleep(5), daemon=True)
+    runner._thread.start()
+    assert runner.liveness()[0]
+    time.sleep(0.3)
+    live, reason = runner.liveness()
+    assert not live and "stalled" in reason
+    runner.pause()
+    assert runner.liveness()[0], "a paused simulator is idle by design, not stalled"
+    runner.resume()
+    assert runner.liveness()[0], "resume resets the progress clock"

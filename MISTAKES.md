@@ -392,3 +392,44 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
   lockfile we do not run.
 - **Fix**: `skip-dirs: .venv`; scan `uv.lock` (0 CRITICAL).
 - **Lesson**: scope a scanner to what you ship, then keep it strict.
+
+## Milestone 8 — Kubernetes (kind)
+
+### The Ingress was rejected by a webhook that wasn't up yet
+- **What happened**: `kubectl apply -k` failed: `failed calling webhook
+  "validate.nginx.ingress.kubernetes.io" … connection refused`.
+- **Root cause**: ingress-nginx registers an admission webhook before
+  its controller pod is ready.
+- **Fix**: wait for `deployment/ingress-nginx-controller` before
+  applying manifests.
+- **Lesson**: "apply everything" has ordering constraints when
+  admission webhooks are involved.
+
+### A frozen Postgres left the ingestor "healthy" for five hours
+- **What happened**: the liveness drill (`docker compose pause
+  postgres`) produced no restart; the pod logged nothing from 20:27 to
+  01:32 and `/health` stayed 200.
+- **Root cause**: SIGSTOP freezes the server but keeps TCP alive; the
+  DB call blocks forever, so the retry/exhaustion path never runs. The
+  Milestone 3 liveness checked "thread alive", which was true.
+- **Fix**: `last_progress_at` + `stall_timeout_seconds` in both loop
+  services' liveness; proven with 3 kubelet restarts during a 6-minute
+  pause.
+- **Lesson**: liveness must measure progress. Death is only one way to
+  stop working.
+
+### 100% tracing of Kafka messages OOM-looped Tempo (113 restarts)
+- **What happened**: Tempo sat at 509/512 MiB and restarted for hours;
+  the tracing smoke timed out.
+- **Root cause**: one span per message from the simulator and ingestor
+  (~200+/s) after Milestone 6, unnoticed until the cluster work reran
+  the smoke.
+- **Fix**: 2% head sampling for those two services; Tempo 768 MB.
+- **Lesson**: instrumenting a hot loop needs a sampling decision on
+  day one, and a restart count belongs on the dashboard.
+
+### Prometheus lost three targets when services moved into the cluster
+- **Fix**: scrape both the Compose name and the kind NodePort per job;
+  the smoke requires one up per job.
+- **Lesson**: static scrape configs encode topology; every topology
+  change must revisit them (or move to service discovery).

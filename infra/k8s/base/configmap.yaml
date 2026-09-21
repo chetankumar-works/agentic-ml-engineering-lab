@@ -1,0 +1,37 @@
+# Non-secret configuration shared by the AMEL workloads. Values are the
+# Compose service names because the kind node sits on the Compose
+# network (ADR-0010); a real cluster would point these at in-cluster or
+# managed endpoints — that is the whole point of keeping them out of the
+# images.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amel-config
+  namespace: amel
+data:
+  ENVIRONMENT: kind
+  LOG_LEVEL: info
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  OTEL_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  # source_simulator
+  DATA_DIR: /data
+  HIGGS_MAX_ROWS: "500000"
+  EVENTS_PER_SECOND: "100"
+  DUPLICATE_RATE: "0.01"
+  INVALID_EVENT_RATE: "0.002"
+  LABEL_DELAY_SECONDS: "10"
+  KAFKA_MESSAGE_TIMEOUT_MS: "30000"
+  # inference_api
+  INFERENCE_MLFLOW_TRACKING_URI: http://mlflow:5000
+  INFERENCE_FEAST_SERVER_URL: http://feast-server:6566
+  INFERENCE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  INFERENCE_MODEL_REFRESH_SECONDS: "0"
+  MLFLOW_HTTP_REQUEST_MAX_RETRIES: "2"
+  MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
+  # feast-server (auto-instrumented)
+  OTEL_SERVICE_NAME_FEAST: feast_server
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none

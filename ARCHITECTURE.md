@@ -107,7 +107,7 @@ to record.
 
 ## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
 
-Three views, all of what is **built** as of Milestone 7 unless a node is
+Three views, all of what is **built** as of Milestone 8 unless a node is
 marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
 
 ### System context
@@ -253,11 +253,16 @@ flowchart LR
         m7b["scripts/make_synthetic_higgs.py"]
         m7c["GitHub Actions: quality · compose<br/>trivy · 8 images → GHCR · integration"]
     end
-    subgraph next ["M8+ (planned)"]
+    subgraph M8 ["M8 — Kubernetes (kind)"]
+        m8a["infra/k8s: 4 Deployments, Services,<br/>Ingress, ConfigMap/Secret, 2 Jobs"]
+        m8b["startup/liveness/readiness<br/>+ stall watchdog"]
+        m8c["make k8s-up/down · kubeconform in CI"]
+    end
+    subgraph next ["M9+ (planned)"]
         m5["platform_api"]
         m8["Kubernetes"]
     end
-    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> next
+    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> next
 ```
 
 
@@ -376,6 +381,16 @@ Observability (DECISIONS.md ADR-0008):
   prometheus                 scrapes simulator/ingestor/inference /metrics, collector, kafka-exporter
   grafana :3000              datasources Prometheus/Tempo/Loki/AMEL Postgres; "AMEL overview"
   one id                     X-Trace-Id == OTel trace id == log trace_id == ml.predictions.trace_id
+
+Kubernetes (kind, DECISIONS.md ADR-0010) — `make k8s-up`:
+  cluster        1 node on the Compose network (pods resolve postgres/kafka/redis/mlflow/otel-collector)
+  moved          inference-api, feast-server, source-simulator, stream-ingestor → Deployments
+                 (Compose counterparts stopped; NodePorts mapped to the same host ports)
+  config         ConfigMap amel-config · Secret amel-secrets (from env) · ConfigMap simulator-runtime
+  jobs           migrate · feast-apply
+  probes         startup + liveness (/health incl. stall watchdog) + readiness (/ready); maxUnavailable 0
+  ingress        ingress-nginx → http://amel.localtest.me/ → inference-api
+  airflow        FEAST_SERVER_URL=http://amel-control-plane:30566 while the cluster runs
 ```
 
 Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
@@ -436,6 +451,11 @@ during each acceptance run, and what was actually verified:
 - **Reproducible environment** (Milestone 7): pinned image tags, a
   lockfile, non-root images, and a clean-checkout run proven on fresh
   volumes; CI validates every push and builds SHA-tagged images.
+- **Operable under Kubernetes** (Milestone 8): the stateless services
+  run as Deployments with startup/liveness/readiness probes on the
+  honest endpoints plus a progress watchdog; a bad config never
+  receives traffic (readiness-gated rollout, proven), a hung loop is
+  restarted (proven), configuration is injected via ConfigMap/Secret.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 

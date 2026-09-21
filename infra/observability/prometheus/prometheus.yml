@@ -1,15 +1,26 @@
 # Scrapes every first-party /metrics endpoint plus the collector's
 # span-derived RED metrics and Kafka consumer lag.
+#
+# Each first-party job lists two targets: the Compose service name and the
+# kind NodePort (amel-control-plane:3000X, Milestone 8). Whichever mode is
+# running answers; the other shows as down — the dashboards sum over
+# `instance`, and scripts/smoke_milestone6.py requires one up per job.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 scrape_configs:
   - job_name: source_simulator
-    static_configs: [{ targets: ["source-simulator:8001"] }]
+    static_configs:
+      - { targets: ["source-simulator:8001"], labels: { runtime: compose } }
+      - { targets: ["amel-control-plane:30001"], labels: { runtime: kind } }
   - job_name: stream_ingestor
-    static_configs: [{ targets: ["stream-ingestor:8002"] }]
+    static_configs:
+      - { targets: ["stream-ingestor:8002"], labels: { runtime: compose } }
+      - { targets: ["amel-control-plane:30002"], labels: { runtime: kind } }
   - job_name: inference_api
-    static_configs: [{ targets: ["inference-api:8003"] }]
+    static_configs:
+      - { targets: ["inference-api:8003"], labels: { runtime: compose } }
+      - { targets: ["amel-control-plane:30003"], labels: { runtime: kind } }
   - job_name: otel_spanmetrics
     static_configs: [{ targets: ["otel-collector:8889"] }]
   - job_name: kafka

@@ -1,0 +1,27 @@
+# kind cluster for AMEL (Milestone 8, DECISIONS.md ADR-0010).
+# One node. Created on the Compose network (KIND_EXPERIMENTAL_DOCKER_NETWORK=
+# amel_default, see scripts/k8s_up.sh) so pods resolve postgres/kafka/redis/
+# mlflow/otel-collector by their Compose names. The node container is
+# memory-capped after creation (docker update --memory 3g).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: amel
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraMounts:
+      # the HIGGS archive (real or synthetic) for the simulator pod
+      - hostPath: ./data/raw
+        containerPath: /data/raw
+        readOnly: true
+    extraPortMappings:
+      - { containerPort: 80, hostPort: 80, protocol: TCP }        # ingress-nginx
+      - { containerPort: 30001, hostPort: 8001, protocol: TCP }   # source-simulator NodePort
+      - { containerPort: 30002, hostPort: 8002, protocol: TCP }   # stream-ingestor NodePort
+      - { containerPort: 30003, hostPort: 8003, protocol: TCP }   # inference-api NodePort
+      - { containerPort: 30566, hostPort: 6566, protocol: TCP }   # feast-server NodePort

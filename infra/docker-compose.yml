@@ -148,7 +148,9 @@ services:
       AWS_SECRET_ACCESS_KEY: amel_dev_password
       AWS_REGION: us-east-1
       PIPELINE_STAGING_DIR: /opt/airflow/staging
-      FEAST_SERVER_URL: http://feast-server:6566
+      # scripts/k8s_up.sh overrides this with the in-cluster NodePort when
+      # feast-server runs in kind (Milestone 8).
+      FEAST_SERVER_URL: ${FEAST_SERVER_URL:-http://feast-server:6566}
       HIGGS_PIPELINE_SCHEDULE: ${HIGGS_PIPELINE_SCHEDULE:-*/5 * * * *}
       VALIDATION_MAX_INVALID_FRACTION: ${VALIDATION_MAX_INVALID_FRACTION:-0.05}
       LOG_LEVEL: info
@@ -174,6 +176,10 @@ services:
         condition: service_completed_successfully
     environment:
       OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      # High-volume producers/consumers (one span per Kafka message, hundreds/s)
+      # are head-sampled; Tempo (512 MB cap) OOM-looped at 100% (Milestone 8).
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: "${OTEL_KAFKA_TRACE_RATIO:-0.02}"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DATA_DIR: /data
@@ -210,6 +216,10 @@ services:
         condition: service_completed_successfully
     environment:
       OTEL_ENABLED: ${OTEL_ENABLED:-true}
+      # High-volume producers/consumers (one span per Kafka message, hundreds/s)
+      # are head-sampled; Tempo (512 MB cap) OOM-looped at 100% (Milestone 8).
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: "${OTEL_KAFKA_TRACE_RATIO:-0.02}"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DATABASE_URL: postgresql+psycopg://amel:amel_dev_password@postgres:5432/amel
@@ -385,7 +395,7 @@ services:
       - tempo-data:/var/tempo
     ports:
       - "3200:3200"   # Tempo HTTP API (scripts/smoke_milestone6.py, debugging)
-    mem_limit: 512m
+    mem_limit: 768m
 
   loki:
     restart: unless-stopped

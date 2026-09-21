@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     batch_size: int = 500
     batch_timeout_seconds: float = 2.0
     max_retries: int = 5
+    # Liveness fails if the consume loop makes no progress (a completed
+    # poll cycle or batch) for this long. A Postgres that is frozen rather
+    # than down makes the DB call hang forever with no error to retry —
+    # found in Milestone 8's probe test. Must exceed batch_timeout +
+    # the full DB retry budget (~16 s at the defaults).
+    stall_timeout_seconds: float = 120.0
     retry_backoff_base_seconds: float = 0.5
 
     log_level: str = "info"

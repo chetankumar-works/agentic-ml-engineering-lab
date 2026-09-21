@@ -1067,3 +1067,114 @@ smoke at 5,738 rows / 0 duplicates / 26 + 40 DLQ messages and checked
 - "What should a CI pipeline for an ML platform verify on every PR, and
   what should only happen on main?"
 - "Why pin image tags, and what is the cost?"
+
+## Milestone 8 — Kubernetes (kind)
+
+**WHAT WAS BUILT.** `infra/k8s/`: `kind-config.yaml` (one node,
+hostPath mount for the dataset, host port mappings), `base/`
+(Namespace, ConfigMap, Deployments + NodePort Services for
+`inference-api`, `feast-server`, `source-simulator`, `stream-ingestor`,
+an Ingress, a kustomization), `jobs/` (`migrate`, `feast-apply`),
+`secret.example.yaml` (template only). `scripts/k8s_up.sh` /
+`k8s_down.sh` (`make k8s-up/down/status/validate`). A stall watchdog in
+both loop services' liveness. 2% trace sampling for the Kafka-heavy
+services. `kubeconform` in CI. ADR-0010.
+
+**WHY IT EXISTS.** Compose proves the services work; Kubernetes proves
+they are *operable*: a scheduler restarts what dies, readiness decides
+what receives traffic, rollouts are gated, configuration is injected
+rather than baked. Milestones 9 (Kubeflow) and 10 (HPA/KEDA) build on
+this cluster.
+
+**HOW IT IS WIRED.**
+1. `make k8s-up` stops the four Compose services, creates the kind
+   cluster on `amel_default` (pods resolve Compose names), caps the node
+   at 3 GB, installs ingress-nginx (pinned `controller-v1.15.1`) and
+   waits for its admission webhook, builds and `kind load`s the five
+   images, creates the Secret from env and the `simulator-runtime`
+   ConfigMap (`HIGGS_START_INDEX` = max landed + 1), applies the
+   kustomization, runs the two Jobs, waits for rollouts, and recreates
+   Compose's Airflow with `FEAST_SERVER_URL=http://amel-control-plane:30566`.
+2. Traffic: NodePorts 30001–30003/30566 are mapped to host ports
+   8001–8003/6566, so every earlier `make smoke*` target works
+   unchanged; the Ingress serves `http://amel.localtest.me/`.
+3. Telemetry: pods export OTLP to `otel-collector:4318` over the Compose
+   network; Prometheus scrapes both the Compose names and the NodePorts
+   (labelled `runtime=compose|kind`).
+
+**WHAT THE PROBES DID (measured).**
+- Bad config rollout (`INFERENCE_MLFLOW_TRACKING_URI=http://nowhere:5000`):
+  new pod `Ready: false` (`no model loaded: … nowhere:5000`), old pod
+  kept serving v5 via the Service, `rollout status` timed out (blocked),
+  `rollout undo` restored a single ready pod.
+- Frozen Postgres (`docker compose pause postgres`): before the fix the
+  ingestor hung with `/health` 200 and no log line for the whole window;
+  after the stall watchdog: `503 consume loop stalled for 67s` → kubelet
+  `Liveness probe failed` → `Killing … will be restarted` → 3 restarts
+  in ~6 minutes → `Ready: true` and ingesting within seconds of unpause
+  (landing rows kept growing: 2,113,519 → 2,149,789).
+- In-cluster ingestion: simulator started at `HIGGS_START_INDEX=2097438`,
+  ingestor assigned all partitions; Airflow's `update_feature_store`
+  reached the in-cluster feast-server (`materialized, windows=1`);
+  `make smoke-tracing` passed against the NodePort (13 spans, 2
+  services).
+
+**MEMORY (measured).** Node anon 1.44 GB with the four pods, 1.72 GB
+with ingress-nginx and after the probe tests; `docker stats` 2.3–2.5 GB
+including image page cache; host 8.1 → 8.9 GB used, 6.9 GB available,
+all containers 10.3 GB by `docker stats`. Tempo needed 768 MB after
+sampling (was OOM-looping at 512 MB with 100% Kafka spans).
+
+**IMPORTANT CODE FILES.**
+- `scripts/k8s_up.sh` — the whole procedure, in order.
+- `infra/k8s/base/inference-api.yaml` — probe/rollout settings and
+  the comments explaining each.
+- `infra/k8s/base/configmap.yaml`, `infra/k8s/secret.example.yaml` —
+  what is config, what is secret.
+- `services/stream_ingestor/src/stream_ingestor/consumer.py` and
+  `services/source_simulator/src/source_simulator/simulator.py` —
+  `last_progress_at` and the stall rule in `liveness()`.
+- `infra/observability/prometheus/prometheus.yml` — dual targets.
+- `DECISIONS.md` ADR-0010.
+
+**FAILURE MODES / SURPRISES (exercised).**
+- ingress-nginx's admission webhook rejects Ingress objects until the
+  controller is up (`connection refused`) — wait for the Deployment
+  before `apply -k`.
+- A SIGSTOPped database is not a "down" database: no connection error,
+  no timeout, no retry — only a progress watchdog sees it.
+- 100% tracing of per-message Kafka spans OOM-looped Tempo.
+- Prometheus targets by Compose name go down when a service moves —
+  scrape both locations.
+
+**HOW TO TEST IT.**
+- `make k8s-validate` (kubeconform; also in CI), `make k8s-up`,
+  `make k8s-status`, `kubectl -n amel get events --sort-by=.lastTimestamp`,
+  `make smoke-tracing`, `curl amel.localtest.me/model`.
+- Probe drills: `kubectl -n amel set env deployment/inference-api
+  INFERENCE_MLFLOW_TRACKING_URI=http://nowhere:5000` then `rollout
+  undo`; `docker compose -f infra/docker-compose.yml pause postgres`
+  for ~2 minutes and watch `kubectl -n amel get pods -w`.
+- `make k8s-down` returns everything to Compose.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Startup vs liveness vs readiness, what each failure *does* (nothing /
+  restart / stop routing), and why liveness must mean "no progress",
+  not "process exists".
+- Rollout gating with `maxUnavailable: 0`; why a bad config never
+  reaches traffic.
+- ConfigMap vs Secret vs image: the same image in two runtimes.
+- NodePort vs Ingress vs port-forward on a local cluster.
+- Requests/limits and node-level caps as nested blast-radius controls.
+- Trace sampling as the first cost lever at volume.
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "A pod is Running and Ready but doing no work. What's wrong with its
+  probes?" (liveness measures existence, not progress)
+- "How does a rolling update avoid serving a broken config?"
+- "Where do secrets go in Kubernetes and what must never be in the
+  repo?"
+- "Why did your tracing backend fall over when you added a consumer,
+  and what did you change?"
+- "How do you run part of a system in Kubernetes and the rest outside
+  it during a migration?"

@@ -1,0 +1,23 @@
+# One-shot Alembic migration as a Kubernetes Job (the Compose `migrate`
+# service's equivalent). `make k8s-migrate` deletes and re-creates it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: amel
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }
+      containers:
+        - name: migrate
+          image: amel-migrate:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef: { name: amel-secrets }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }

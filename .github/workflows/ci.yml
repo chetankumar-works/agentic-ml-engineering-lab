@@ -44,6 +44,19 @@ jobs:
       - uses: actions/checkout@v7
       - run: docker compose -f infra/docker-compose.yml --profile train --profile feast-demo config -q
 
+  k8s-manifests:
+    name: kubernetes manifest validation (kubeconform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+      - run: kubeconform -strict -summary -ignore-missing-schemas infra/k8s/base infra/k8s/jobs infra/k8s/secret.example.yaml
+      - name: kustomize build
+        run: kubectl kustomize infra/k8s/base > /dev/null
+
   security:
     name: dependency vulnerability scan (trivy)
     runs-on: ubuntu-latest

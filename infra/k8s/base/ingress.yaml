@@ -1,0 +1,20 @@
+# ingress-nginx (installed by scripts/k8s_up.sh) routes the inference API
+# at http://amel.localtest.me/ (localtest.me resolves to 127.0.0.1) via
+# the kind node's hostPort 80.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: amel
+  namespace: amel
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: amel.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: inference-api, port: { name: http } }

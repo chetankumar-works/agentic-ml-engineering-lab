@@ -19,10 +19,10 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 7 (hardened Compose stack — pinned images, non-root, restart
-policies; GitHub Actions CI with SHA-tagged images on GHCR and an
-integration job on a synthetic dataset; clean checkout proven end to
-end) on top of Milestone 6's observability stack, Milestone 5's FastAPI
+Milestone 8 (the four stateless services on a kind cluster next to
+Compose — probes, ConfigMap/Secret, Jobs, Ingress, a 3 GB node cap —
+with a stall watchdog added after a frozen database fooled liveness) on
+top of Milestone 7's hardened Compose stack and CI, Milestone 6's observability stack, Milestone 5's FastAPI
 inference API, Milestone 4's reproducible training + MLflow
 registry, Milestone 3's Feast/Redis feature store, Milestone
 2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
@@ -58,6 +58,7 @@ make train                     # Milestone 4: one training run -> MLflow, regist
 make promote DECIDED_BY=you    # explicit, audited candidate -> champion (exit 2 if criteria fail)
 make model-show                # current candidate/champion
 make smoke-tracing             # Milestone 6: one prediction traced response -> Tempo -> Loki -> Postgres
+make k8s-up / k8s-down / k8s-status / k8s-validate   # Milestone 8: kind cluster for the stateless services
 make down          # stop everything
 ```
 
@@ -71,7 +72,8 @@ Memory: this stack has been measured at roughly 5–6 GB resident with
 everything up (Kafka ~0.9 GB, Airflow ~1.5 GB, Redis ~0.5 GB at ~1M
 entities, feast-server ~0.2–0.4 GB, MLflow ~0.5 GB, inference-api
 ~0.25 GB); the observability stack adds ≈0.9 GB (all capped). ~9 GB of
-15 with everything up. Every Feast container is
+15 with everything up; the kind cluster (Milestone 8) adds ~1.7 GB real
+(node capped at 3 GB) while replacing ~0.9 GB of Compose containers. Every Feast container is
 memory-capped; do not run unbounded `feast materialize` — see
 `RUNBOOKS.md`.
 

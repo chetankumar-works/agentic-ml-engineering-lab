@@ -101,6 +101,7 @@ class SimulatorRunner:
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
         self.dispatcher = DelayedDispatcher()
+        self.last_progress_at = time.monotonic()
         self._thread = threading.Thread(target=self._run, daemon=True, name="simulator-loop")
         self._start_time = time.monotonic()
 
@@ -118,6 +119,7 @@ class SimulatorRunner:
         logger.info("simulator_paused")
 
     def resume(self) -> None:
+        self.last_progress_at = time.monotonic()  # a pause is not a stall
         self.pause_event.set()
         metrics.PAUSED.set(0)
         logger.info("simulator_resumed")
@@ -154,6 +156,10 @@ class SimulatorRunner:
             return False, "simulator loop thread exited unexpectedly"
         if not self.producer.poll_thread_alive:
             return False, "kafka producer poll thread exited"
+        if self._thread.ident is not None and not self.paused and self.ready:
+            stalled = time.monotonic() - self.last_progress_at
+            if stalled > self.settings.stall_timeout_seconds:
+                return False, f"simulator loop stalled for {stalled:.0f}s"
         return True, "ok"
 
     def readiness(self) -> tuple[bool, str]:
@@ -237,6 +243,7 @@ class SimulatorRunner:
 
             with self.counters.lock:
                 self.counters.rows_read += 1
+            self.last_progress_at = time.monotonic()
 
             rate = self._effective_rate()
             metrics.CURRENT_RATE.set(rate)

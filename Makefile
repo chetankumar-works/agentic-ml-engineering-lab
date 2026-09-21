@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing k8s-up k8s-down k8s-status k8s-validate
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -67,3 +67,18 @@ model-show:          # current candidate/champion from the registry
 
 smoke-tracing:       # one prediction traced end to end: response -> Tempo -> Loki -> Postgres
 	uv run python scripts/smoke_milestone6.py
+
+# --- Kubernetes on kind (Milestone 8) ---
+
+k8s-up:              # kind cluster next to Compose; moves inference-api, feast-server, simulator, ingestor
+	./scripts/k8s_up.sh
+
+k8s-down:            # delete the cluster, hand the four services back to Compose
+	./scripts/k8s_down.sh
+
+k8s-status:
+	kubectl -n amel get deploy,pods,svc,ingress,jobs
+	docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' amel-control-plane
+
+k8s-validate:        # schema-validate every manifest (also runs in CI)
+	kubeconform -strict -summary -ignore-missing-schemas infra/k8s/base infra/k8s/jobs infra/k8s/secret.example.yaml

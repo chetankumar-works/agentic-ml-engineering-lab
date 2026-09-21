@@ -117,9 +117,14 @@ def main() -> int:
 
     print("=== 5. Prometheus: targets up + span-derived RED metrics ===")
     _, _, b = get(f"{PROM_URL}/api/v1/targets")
-    targets = {t["labels"]["job"]: t["health"] for t in json.loads(b)["data"]["activeTargets"]}
-    down = [j for j, h in targets.items() if h != "up"]
-    assert not down, f"targets down: {down}"
+    # First-party jobs have a Compose target and a kind NodePort target
+    # (Milestone 8); exactly one of them answers depending on where the
+    # service runs, so the rule is "at least one up per job".
+    targets: dict[str, list[str]] = {}
+    for t in json.loads(b)["data"]["activeTargets"]:
+        targets.setdefault(t["labels"]["job"], []).append(t["health"])
+    down = [j for j, hs in targets.items() if "up" not in hs]
+    assert not down, f"jobs with no target up: {down}"
     q = urllib.parse.quote("sum by (service_name) (traces_span_metrics_calls_total)")
 
     def red_metrics():  # noqa: ANN202

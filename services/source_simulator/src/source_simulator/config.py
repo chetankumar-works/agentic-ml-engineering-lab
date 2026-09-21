@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # A delivery error makes /ready fail until either a later delivery
     # succeeds or this many seconds pass without another error.
     readiness_error_window_seconds: float = 30.0
+    # Liveness fails if the publish loop makes no progress for this long
+    # while not paused (a hung producer call; see stream_ingestor's
+    # stall_timeout_seconds for the incident).
+    stall_timeout_seconds: float = 120.0
 
     random_seed: int = 42
     log_level: str = "info"

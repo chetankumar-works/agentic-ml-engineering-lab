@@ -97,3 +97,21 @@ def test_loop_crash_fails_liveness(monkeypatch: Any) -> None:
     live, reason = ingestor.liveness()
     assert not live and "db exhausted retries" in reason
     assert not ingestor.ready
+
+
+def test_stalled_loop_fails_liveness_even_though_the_thread_is_alive(monkeypatch: Any) -> None:
+    import threading
+    import time as _time
+
+    ingestor, consumer = _ingestor()
+    consumer.on_assign(consumer, _partitions())
+    ingestor.settings.stall_timeout_seconds = 0.2
+    ingestor._thread = threading.Thread(target=lambda: _time.sleep(5), daemon=True)
+    ingestor._thread.start()  # alive, but never touches last_progress_at
+    assert ingestor.liveness() == (True, "ok")
+    _time.sleep(0.3)
+    live, reason = ingestor.liveness()
+    assert not live and "stalled" in reason
+    assert not ingestor.ready
+    ingestor.last_progress_at = _time.monotonic()  # progress resumes
+    assert ingestor.liveness()[0]

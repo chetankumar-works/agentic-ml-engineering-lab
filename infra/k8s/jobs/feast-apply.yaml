@@ -1,0 +1,21 @@
+# One-shot `feast apply` as a Job (registers/updates the feature repo).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: feast-apply
+  namespace: amel
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }
+      containers:
+        - name: feast-apply
+          image: amel-feast-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["feast", "apply"]
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 1Gi }

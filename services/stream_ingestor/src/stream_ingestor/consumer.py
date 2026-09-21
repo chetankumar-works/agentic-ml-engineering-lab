@@ -22,8 +22,8 @@ loop makes that safe by:
    thread while /health kept returning 200 for an hour (RUNBOOKS.md).
 
 Probe contract (Milestone 8's Kubernetes probes point at these):
-- /health (liveness) is 503 only when the loop is dead — a restart is
-  the only way out.
+- /health (liveness) is 503 only when the loop is dead or has made no
+  progress for `stall_timeout_seconds` — a restart is the only way out.
 - /ready (readiness) is additionally 503 while we hold no partition
   assignment or the last offset commit was rejected and no commit has
   succeeded since.
@@ -61,6 +61,7 @@ class StreamIngestor:
         self.loop_error: str | None = None
         self.last_commit_error: str | None = None
         self.commit_failures = 0
+        self.last_progress_at = time.monotonic()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # `consumer` is injectable so the loop/probe logic is unit-testable
@@ -103,6 +104,11 @@ class StreamIngestor:
             return False, f"consume loop died: {self.loop_error}"
         if self._thread is not None and not self._thread.is_alive() and not self._stop.is_set():
             return False, "consume loop thread exited unexpectedly"
+        stalled = time.monotonic() - self.last_progress_at
+        if self._thread is not None and stalled > self.settings.stall_timeout_seconds:
+            # Alive but stuck (e.g. a DB call that never returns) — the
+            # thread check above cannot see this; only progress can.
+            return False, f"consume loop stalled for {stalled:.0f}s"
         return True, "ok"
 
     def readiness(self) -> tuple[bool, str]:
@@ -142,6 +148,7 @@ class StreamIngestor:
                 batch = self._poll_batch()
                 if batch:
                     self._process_batch(batch)
+                self.last_progress_at = time.monotonic()
         except Exception as exc:  # noqa: BLE001 — thread boundary: record for liveness
             self.loop_error = repr(exc)
             logger.critical("stream_ingestor_loop_died", error=repr(exc), exc_info=True)

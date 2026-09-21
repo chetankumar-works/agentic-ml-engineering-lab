@@ -439,3 +439,45 @@ group** for an hour.
 - `build <image>`: `docker build -f <dockerfile> .` from the repo root.
 - An `Unable to resolve action` error is a stale pin: `gh api
   repos/<owner>/<action>/tags --jq '.[0:3][].name'`.
+
+## kind cluster: pods can't reach Postgres/Kafka, or Airflow can't reach feast-server
+
+- Symptom: pods `CrashLoopBackOff`/`Ready: false` with DNS or connection
+  errors for `postgres`/`kafka`; or the DAG's `update_feature_store`
+  fails after `make k8s-up`/`k8s-down`.
+- Diagnosis:
+  ```bash
+  docker network inspect amel_default --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep control-plane
+  kubectl -n amel run -q --rm -i --restart=Never dns --image=busybox:1.36 -- nslookup kafka
+  docker exec amel-airflow-1 env | grep FEAST_SERVER_URL
+  ```
+- Causes: the cluster was created without
+  `KIND_EXPERIMENTAL_DOCKER_NETWORK=amel_default` (recreate via `make
+  k8s-down && make k8s-up`); Airflow still points at the wrong runtime
+  (`make k8s-up` sets `amel-control-plane:30566`, `make k8s-down` resets
+  to `feast-server:6566`).
+
+## A loop service is restarting on liveness ("stalled for Ns")
+
+- Symptom: `kubectl -n amel get events` shows `Liveness probe failed:
+  503` / `Killing … failed liveness probe`; `/health` body says
+  `consume loop stalled` or `simulator loop stalled`.
+- Meaning: the loop made no progress for `STALL_TIMEOUT_SECONDS` (120 s
+  default) — typically a dependency that hangs rather than fails (a
+  frozen Postgres for the ingestor, a wedged broker for the simulator).
+  Restarting cannot fix the dependency; it makes the outage visible.
+- Diagnosis: `docker ps --format '{{.Names}} {{.Status}}' | grep -E
+  'postgres|kafka'` (Paused? unhealthy?), `docker compose … logs
+  postgres kafka --tail=50`.
+- Recovery: fix the dependency; the pod becomes Ready on its own.
+
+## Tempo restarting / at its memory cap
+
+- Symptom: `docker inspect amel-tempo-1 --format '{{.RestartCount}}'`
+  climbing; `make smoke-tracing` times out on Tempo; collector logs
+  `Exporting failed. Will retry`.
+- Cause: span volume. 100% of per-message Kafka spans (simulator +
+  ingestor) did this in Milestone 8.
+- Fix: keep `OTEL_TRACES_SAMPLER_ARG` low for those services
+  (`OTEL_KAFKA_TRACE_RATIO`, default 0.02) — they are set in Compose and
+  in the k8s Deployments; Tempo has 768 MB.

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-api
+  namespace: amel
+  labels: { app: inference-api, app.kubernetes.io/part-of: amel }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: inference-api }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }   # readiness gates the swap
+  template:
+    metadata:
+      labels: { app: inference-api }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }
+      containers:
+        - name: inference-api
+          image: amel-inference-api:latest
+          imagePullPolicy: IfNotPresent   # `kind load docker-image` (scripts/k8s_up.sh)
+          ports: [{ name: http, containerPort: 8003 }]
+          envFrom:
+            - configMapRef: { name: amel-config }
+            - secretRef: { name: amel-secrets }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          # Start-up: resolving @champion + downloading the model can take
+          # a few seconds (longer if MLflow is cold). Liveness = "process
+          # can serve or recover"; readiness = model loaded + feast-server
+          # + Postgres + Kafka delivery — the honest probes from M3/M5.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            failureThreshold: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-api
+  namespace: amel
+  labels: { app: inference-api }
+spec:
+  type: NodePort
+  selector: { app: inference-api }
+  ports:
+    - { name: http, port: 8003, targetPort: http, nodePort: 30003 }

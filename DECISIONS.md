@@ -594,3 +594,88 @@ job in Milestone 8 (`kubeconform`); extend the integration job to
 Feast + inference if a larger runner becomes available; add image
 scanning (not just lockfile) once images are pulled from GHCR by
 Kubernetes.
+
+## ADR-0010: kind next to Compose — only stateless services move, the node is memory-capped, and probes must detect "alive but stuck"
+
+**Problem.** Milestone 8 needed core stateless services on a local
+Kubernetes cluster with health probes and configuration separation, on
+the same 15 GB host that already runs the 20-container Compose stack.
+
+**Decision.**
+1. **kind, one node, on the Compose network.** The cluster is created
+   with `KIND_EXPERIMENTAL_DOCKER_NETWORK=amel_default`, so pods resolve
+   `postgres`, `kafka:9092`, `redis`, `mlflow`, `otel-collector` by their
+   Compose names — no service mirroring, no host networking tricks. The
+   node container is capped right after creation
+   (`docker update --memory 3g amel-control-plane`).
+2. **Four services move, nothing stateful does:** `inference-api`,
+   `feast-server`, `source-simulator`, `stream-ingestor` become
+   Deployments (+ NodePort Services, an Ingress for the API via
+   ingress-nginx at `amel.localtest.me`). Postgres, Kafka, Redis, MinIO,
+   MLflow, Airflow and the observability stack stay in Compose.
+   `make k8s-up` stops the four Compose counterparts first and points
+   Compose's Airflow at the in-cluster feast-server NodePort; `make
+   k8s-down` reverses it. `migrate` and `feast apply` run as Jobs.
+3. **Configuration separation:** one ConfigMap for non-secret settings,
+   one Secret created by the script from environment variables (a
+   committed `secret.example.yaml` documents the keys), a
+   `simulator-runtime` ConfigMap carrying `HIGGS_START_INDEX` computed at
+   deploy time. Images are the same ones Compose builds, loaded with
+   `kind load docker-image`.
+4. **Probes are the M3/M5 endpoints, plus a stall watchdog.** Startup,
+   liveness (`/health`) and readiness (`/ready`) on every Deployment;
+   `maxUnavailable: 0` so readiness gates rollouts. The M8 probe test
+   found that a *frozen* Postgres (SIGSTOP) makes the ingestor's DB call
+   hang forever — thread alive, no error to retry, `/health` 200. Both
+   loop services now fail liveness when no progress has been made for
+   `stall_timeout_seconds` (120 s default; a paused simulator is exempt).
+5. **Head-sample the Kafka-heavy services.** Per-message spans from the
+   simulator and ingestor OOM-looped Tempo (113 restarts at 512 MB);
+   they now sample 2% (`parentbased_traceidratio`), inference stays at
+   100%, Tempo gets 768 MB.
+6. CI validates every manifest with `kubeconform` and `kubectl
+   kustomize`.
+
+**Reason.**
+1. kind is one container (~1.2 GB idle, kube-apiserver alone ~300 MB);
+   minikube's docker driver is the same idea with more defaults. The
+   Compose-network trick is what makes "move only stateless services"
+   cheap: nothing in the cluster needs to know it is talking to Compose.
+   Measured: pods resolved and reached `kafka:9092`/`postgres:5432` on
+   the first try.
+2. Stateful services on a single-node kind cluster would only add
+   PersistentVolume ceremony without teaching anything the Compose
+   volumes don't; the acceptance names *stateless* services. Net memory
+   cost measured: node anon **1.7 GB** with all four pods + ingress-nginx
+   (docker stats shows 2.3–2.5 GB because loaded images sit in page
+   cache, which is reclaimable); the four Compose containers it replaced
+   were ~0.9 GB; host went from ~8.1 to ~8.9 GB used, 6.9 GB available.
+3. The same images with different config is the point of the exercise;
+   the bad-config rollout test (wrong MLflow URL) proved readiness holds
+   the old pod in service while the new one sits `Ready: false` with
+   `no model loaded: … nowhere:5000`, then `rollout undo` restores it.
+4. "Loop thread alive" was the M3 definition of liveness; a hung
+   syscall satisfies it while doing nothing. Progress is the only signal
+   that covers both death and hang. Proven: Postgres paused → `503
+   consume loop stalled for 67s` → kubelet `Killing … failed liveness
+   probe` → 3 restarts during the pause → `Ready: true` and ingesting
+   again after unpause.
+5. Sampling is the standard lever; 2% of ~200 spans/s keeps the linked
+   consumer traces visible for debugging without drowning Tempo. RED
+   metrics for those two services are now sampled estimates (documented
+   on the dashboard); inference RED stays exact.
+
+**Tradeoffs.** Two runtimes to keep in sync (Compose and k8s manifests
+carry the same env keys — a drift risk; the ConfigMap comments point at
+Compose). Airflow's `FEAST_SERVER_URL` flips per mode via an env
+override. NodePorts reuse the Compose host ports, so the two modes are
+mutually exclusive for those four services. Single node → no real
+scheduling, no PDBs. Docker page cache inflates the node's apparent
+memory. A stalled ingestor is *restarted*, which does not fix a frozen
+database — but it makes the outage visible where before it was silent.
+
+**Future reconsideration trigger.** Milestone 10 (HPA/KEDA) will need
+metrics-server and more ingestor replicas — re-measure the 3 GB cap
+then. If Compose/k8s config drift bites, generate both from one source.
+Move the stateful services in only when a multi-node or managed cluster
+exists.

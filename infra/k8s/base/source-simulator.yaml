@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: source-simulator
+  namespace: amel
+  labels: { app: source-simulator, app.kubernetes.io/part-of: amel }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # two simulators would double-publish
+  selector:
+    matchLabels: { app: source-simulator }
+  template:
+    metadata:
+      labels: { app: source-simulator }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }
+      volumes:
+        - name: dataset
+          hostPath: { path: /data/raw, type: Directory }   # kind extraMount of ./data/raw
+      containers:
+        - name: source-simulator
+          image: amel-source-simulator:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8001 }]
+          env:
+            # one span per Kafka message at 100% OOM-looped Tempo; sample (ADR-0010)
+            - { name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio }
+            - { name: OTEL_TRACES_SAMPLER_ARG, value: "0.02" }
+          envFrom:
+            - configMapRef: { name: amel-config }
+            - configMapRef: { name: simulator-runtime, optional: true }   # HIGGS_START_INDEX, set by make k8s-up
+          volumeMounts:
+            - { name: dataset, mountPath: /data, readOnly: true }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 256Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60   # dataset download on first start can be slow
+          livenessProbe:
+            httpGet: { path: /health, port: http }   # 503 when the publish loop is dead / producer fatal
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }    # 503 while Kafka rejects our writes
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: source-simulator
+  namespace: amel
+spec:
+  type: NodePort
+  selector: { app: source-simulator }
+  ports:
+    - { name: http, port: 8001, targetPort: http, nodePort: 30001 }
