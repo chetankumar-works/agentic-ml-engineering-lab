@@ -373,3 +373,86 @@ Kafka spans; Prometheus targets lost on topology change.
 **Known gaps at close.** Env keys duplicated across Compose/k8s; modes
 mutually exclusive for moved services; no metrics-server; sampled RED
 for two services; earlier carry-overs.
+
+## Milestone 9 — Kubeflow Pipelines v2 (2026-09-23, tag `milestone-9`)
+
+**Built.**
+- `amel_training.steps`: the M4 workflow as six file-to-file steps
+  (`load_training_dataset` → `validate_training_dataset` →
+  `split_dataset` → `train_model` → `evaluate_model` →
+  `register_model`), each calling the functions `train.py` calls.
+- `ml/pipelines`: one `@dsl.component` per step on
+  `amel-training:local`, the `higgs_training_pipeline` DAG, and
+  compiled IR YAML checked by a test.
+- Three runners on the same code: `run-steps` (in-process),
+  `run-docker` (`kfp.local.DockerRunner`) and `submit` (KFP 2.17.2
+  standalone on kind).
+- `scripts/kfp_up.sh` / `kfp_down.sh`.
+- Compose/kind modes (`scripts/mode.sh`, `make mode*`, guards).
+- Postgres bounded by its own settings.
+- `scripts/mem_sample.sh`.
+
+**Acceptance and proof: training runs as containerized KFP components
+and records results in MLflow.**
+- **KFP on kind:** run `08e728c7-d886-4fe9-8a2f-4a9aecbccedb`
+  SUCCEEDED in 3m46s (`make kfp-submit`, 100k rows). Each component ran
+  as pods: a driver, then an executor pod with the `kfp-launcher` init
+  container and our image.
+- **Recorded in MLflow:** run `kfp-08e728c7-…` (`80c43ef7…`) FINISHED.
+  - params include `orchestrator=kfp`, dataset_n_rows 99,805 and
+    fingerprint `5b868ed8d91a6013`
+  - tags `kfp_run_id`, `git_sha 493c014`
+  - 13 metrics: test accuracy 0.6885, ROC-AUC 0.7540
+  - 11 artifacts
+  - registered as `higgs_decision_tree` **v12, alias `candidate`**; the
+    champion (v5) is untouched, since promotion stays an explicit M4
+    step
+- **"Works outside Kubeflow" held:** `amel-train train` (v6),
+  `run-steps` (v7) and `run-docker` (v8) on the same `as_of` produced
+  fingerprint `81f8a8fd191441aa` and identical metrics (test accuracy
+  0.6825195378, ROC-AUC 0.7528702331). `run-docker` took 1m36s.
+- **Memory (kfp mode, sampled every 2 s over the run):**
+  - node anon peaked at 2.92 GiB of a 6 GiB cap (1.97 GiB idle)
+  - `memory.current` peaked at 5.57 GiB, mostly page cache
+  - full PSI 0.00, with 46 ms of stall in total
+  - Postgres anon + shmem 0.17 GiB (page cache 2.07 GiB)
+  - VM MemAvailable never fell below 10.1 GB
+- **Mode transitions run for real:** compose 22 s → kfp 20 s (plus
+  about 1 min for KFP to be ready) → kfp-down 47 s → k8s 5.5 min.
+  k8s mode: VM 7.16 GB available, node anon 1.61–1.76 GiB of 3, PSI 0.
+- **Quality:** 96 unit tests passed; ruff and mypy clean; CI green.
+
+**Decisions.**
+- ADR-0011: six steps, one image, three runners.
+- ADR-0012: Compose and kind as mutually exclusive modes, a measured
+  budget per mode, Postgres bounded internally, and a projected M10
+  budget.
+
+**Bugs found and fixed.**
+- `from __future__ import annotations` broke `@dsl.component`.
+- The image ENTRYPOINT swallowed KFP's executor command.
+- `:latest` caused `ImagePullBackOff`.
+- Task pods had no `DATABASE_URL`.
+- A root-owned local pipeline root.
+- KFP 2.17 has no `minio` Deployment.
+- **`kfp_down.sh` swallowed failed deletes** (`|| true`) and lowered the
+  node cap onto a live KFP, which livelocked the node. Measured: 83%
+  full stall, 517k major faults, zero OOM kills, and 30–40 liveness
+  restarts per KFP pod.
+- The first fix had two holes of its own:
+  - `set -e` does not see a failing `$(…)` inside `[ ]`; a stub test
+    caught it.
+  - It waited for the namespace before the delete that removes it; the
+    first real run caught that, and it failed safe.
+
+**Known gaps at close.**
+- KFP brings its own MySQL and SeaweedFS.
+- The `:local` image tag only works on this machine.
+- `amel-secrets` is duplicated into the `kubeflow` namespace.
+- Unbounded consumers: MinIO in every mode; Redis (no `maxmemory`,
+  425 MiB already in swap), Airflow and ingress-nginx in k8s mode.
+- The 75% cap margin is a heuristic from two data points.
+- The 28 cgroup `max` events on the node still need a 250 ms-sampled
+  training run to rule out sub-2 s spikes.
+- The M10 budget is projected, not measured, and M10 does not fit the
+  3 GiB k8s cap.

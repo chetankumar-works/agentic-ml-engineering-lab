@@ -1296,3 +1296,33 @@ plain functions first.
 - "Your pipeline pod is in ImagePullBackOff for an image you built
   locally — why?"
 - "Where would a database credential come from inside a KFP task?"
+
+**MEMORY: WHY A CAPPED NODE FROZE INSTEAD OF CRASHING (ADR-0012).**
+- A cgroup `memory.max` is enforced by reclaim first and the OOM killer
+  last. Reclaim takes clean page cache first, and for a node full of
+  processes, page cache includes their *executables and libraries*.
+  When anon fills most of the cap, the kernel keeps evicting code pages
+  that are needed again a moment later: major faults, disk reads, stalls.
+  Nothing is killed because reclaim keeps making tiny progress. That's a
+  livelock, measured at 83% `full` PSI with 0 OOM kills. A cap protects
+  the *host*; it does not make the *container* fail cleanly.
+- PSI (`memory.pressure`) is the signal: `full avg10` is the share of
+  wall time in which every task in the cgroup was stalled on memory.
+  A healthy node reads 0.00 even at 93% `memory.current`, because that
+  memory was page cache.
+- `docker stats` counts active page cache. Postgres "used 3.74 GiB"
+  with 60 MiB anon. The earlier "2.8 GB KFP node" and "2.4 GB Postgres"
+  figures in this log were such numbers. Budgets use anon + shmem.
+- Bound a service inside itself (Postgres `max_connections`,
+  `work_mem`, parallel workers; JVM `-Xmx`; librdkafka
+  `queued.max.messages.kbytes`) so it never presses on a cap. The cap is
+  a backstop.
+- `set -e` traps: a failing command substitution inside `[ … ]` or
+  inside an `if` condition does not exit. Assign first (`x=$(cmd)`),
+  then test.
+
+**INTERVIEW QUESTIONS (memory).**
+- "Your container has a memory limit, yet the machine froze and nothing
+  was OOM-killed. What happened?"
+- "Why is `docker stats` the wrong number for capacity planning?"
+- "How do you bound Postgres memory without a container limit?"

@@ -7,72 +7,51 @@ clean stopping point mid-milestone) per the Definition of Done in
 
 ## Current milestone
 
-**Milestone 8 — Kubernetes (kind).** Complete.
+**Milestone 9 — Kubeflow Pipelines v2.** Complete (tag `milestone-9`).
+**Milestone 10 has not started**: its memory budget (DECISIONS.md
+ADR-0012, "Projected budget for M10") needs approval first.
 
-## Completed work (Milestone 8; earlier milestones in MILESTONE_REPORT.md)
+**Machine state at close:** `k8s` mode (`make mode`). The kind node is
+at 3g with KFP removed, the M8 services are running, and Compose is
+everything except the four moved services.
 
-- **`infra/k8s/`**: `kind-config.yaml` (1 node, dataset hostPath mount,
-  host ports 80/8001/8002/8003/6566), `base/` (Namespace `amel`,
-  ConfigMap `amel-config`, Deployments + NodePort Services for
-  `inference-api`, `feast-server`, `source-simulator`, `stream-ingestor`
-  with startup/liveness/readiness probes, requests/limits, non-root
-  securityContext, `maxUnavailable: 0`; Ingress `amel.localtest.me`;
-  kustomization), `jobs/` (`migrate`, `feast-apply`),
-  `secret.example.yaml` (template — the real Secret is created from env).
-- **`scripts/k8s_up.sh` / `k8s_down.sh`** (`make k8s-up/down/status/
-  validate`): cluster on the Compose network, node capped at 3 GB,
-  ingress-nginx `controller-v1.15.1`, images via `kind load`, Secret +
-  `simulator-runtime` ConfigMap (`HIGGS_START_INDEX`), Jobs, rollouts,
-  Airflow re-pointed at the in-cluster feast-server.
-- **Stall watchdog** in `stream_ingestor` and `source_simulator`
-  liveness (`stall_timeout_seconds`, default 120 s) — found necessary
-  by the probe drill (a frozen Postgres hung the loop with `/health`
-  200). 2 new unit tests.
-- **Trace sampling** for the two Kafka-heavy services (2%,
-  `OTEL_KAFKA_TRACE_RATIO`) after Tempo OOM-looped; Tempo 768 MB.
-- **Prometheus** scrapes Compose names *and* kind NodePorts
-  (`runtime` label); `smoke_milestone6.py` requires one target up per job.
-- **CI**: `kubeconform` + `kubectl kustomize` job. Tools: kind v0.33.0,
-  kubeconform v0.8.0 (in `~/.local/bin`), kubectl v1.36.1, cluster
-  v1.37.0. 90 → **92 unit tests**.
+## Completed work (Milestone 9; earlier milestones in MILESTONE_REPORT.md)
 
-## Milestone 8 acceptance run
+- **`ml/training/src/amel_training/steps.py`**: six file-to-file steps
+  plus `run_all`, calling what `train.py` calls.
+- **`ml/pipelines/`** (`amel-pipeline`): components on
+  `amel-training:local`, `higgs_training_pipeline`, compiled IR, and the
+  `run-steps` / `run-docker` / `submit` runners.
+- **KFP on kind**: `scripts/kfp_up.sh` (runs only in kfp mode) and
+  `scripts/kfp_down.sh` (deletes both kustomizations, verifies the
+  `kubeflow` namespace is gone, then lowers the cap to 3g; fails safe
+  otherwise).
+- **Modes (ADR-0012)**: `scripts/mode.sh`, `make mode | mode-compose |
+  mode-k8s | mode-kfp`. The full Compose stack and the node never run
+  together. The node cap identifies the mode, and guards sit in the up
+  scripts.
+- **Postgres bounded by its own settings** (Compose `command:`):
+  max_connections 50, max_parallel_workers 2, jit off, the rest
+  explicit.
+- **`scripts/mem_sample.sh`**: read-only cgroup sampler (VM, node, pods,
+  Compose), down to 250 ms.
+- 92 → **96 unit tests**.
 
-Run 2026-09-20/21 (option (a) from the memory plan: kind alongside
-Compose, 3 GB node cap).
+## Milestone 9 acceptance run
 
 ```
-make k8s-up                        57 s (cluster pre-created earlier: kind create ~40 s)
-  pods                             feast-server, inference-api, source-simulator, stream-ingestor 1/1 Running;
-                                   migrate + feast-apply Jobs Completed
-  DNS from a pod                   kafka:9092 reachable, postgres:5432 reachable (Compose network)
-  NodePort                         localhost:8003/ready -> 200; /model -> v5 @champion
-  Ingress                          http://amel.localtest.me/model -> 200 (ingress-nginx, hostPort 80)
-  probes (kubectl describe)        Startup /health 5s×24 · Liveness /health 10s×3 · Readiness /ready 10s×2
-  in-cluster ingestion             simulator start_index 2097438; ingestor assigned; landing 2,100,393 -> 2,149,789
-  Airflow -> in-cluster feast      FEAST_SERVER_URL=http://amel-control-plane:30566; DAG 10/10, materialized windows=1
-  make smoke-tracing               PASSED against the NodePort (13 spans, inference_api + feast_server)
-
-Probe drills:
-  bad config rollout               set INFERENCE_MLFLOW_TRACKING_URI=http://nowhere:5000 ->
-                                   new pod Ready=false ("no model loaded: ... nowhere:5000"), old pod serving v5,
-                                   rollout status blocked; rollout undo -> 1 ready pod
-  frozen Postgres (pause)          BEFORE fix: no restart, no log line for the whole window, /health 200 (lie)
-                                   AFTER stall watchdog: /health "503 consume loop stalled for 67s" ->
-                                   kubelet "Killing ... failed liveness probe" -> 3 restarts in ~6 min ->
-                                   Ready=true seconds after unpause, ingestion resumed
-
-Memory:
-  kind node                        anon 1.44 GB (4 pods) -> 1.72 GB (+ingress-nginx, after drills);
-                                   docker stats 2.3–2.5 GB incl. image page cache; cap 3 GB
-  host                             8.1 GB used before -> 8.9 GB with the cluster (6.9 GB available);
-                                   all containers 10.3 GB by docker stats
-  Tempo                            113 restarts at 512 MB with 100% Kafka spans -> 0 restarts, ~100 MB after 2% sampling
+make mode-kfp                      20 s: Compose trimmed to postgres/minio/mlflow, node cap 6g, amel Deployments -> 0
+make kfp-up                        1m22s (mode check passed; KFP 2.17.2, 14 pods Running)
+make kfp-submit                    run 08e728c7-d886-4fe9-8a2f-4a9aecbccedb SUCCEEDED in 3m46s
+  MLflow                           run kfp-08e728c7-... FINISHED; params orchestrator=kfp, dataset_n_rows 99805;
+                                   tags kfp_run_id, git_sha 493c014; 13 metrics (test acc 0.6885, ROC-AUC 0.7540);
+                                   11 artifacts; higgs_decision_tree v12 @candidate (champion v5 unchanged)
+  memory (2 s samples)             node anon 1.97 -> 2.92 GiB peak (cap 6), full PSI 0.00; Postgres anon+shmem 0.17 GiB;
+                                   VM MemAvailable >= 10.1 GB throughout
+make kfp-down                      47 s: namespace verified gone, cap -> 3g
+make mode-k8s                      5m33s: M8 services rolled out, Airflow -> in-cluster feast; VM 7.16 GB available
+Earlier (same code): train v6 / run-steps v7 / run-docker v8 -> fingerprint 81f8a8fd191441aa, identical metrics
 ```
-
-**Milestone 8 acceptance verified**: the core stateless services run
-on kind with health probes that provably act (rollout gating, liveness
-restart) and with configuration separated into ConfigMap/Secret.
 
 ## Verified tool versions (WSL2, Ubuntu 26.04 LTS "resolute")
 
@@ -86,48 +65,55 @@ see git history for the full table. Additions this milestone:
 `docker/build-push-action@v7`, `docker/setup-buildx-action@v4`,
 `docker/login-action@v4`. Milestone 8: kind v0.33.0 (cluster
 Kubernetes v1.37.0), kubeconform v0.8.0, kubectl v1.36.1, ingress-nginx
-`controller-v1.15.1`.
+`controller-v1.15.1`. Milestone 9 (re-verified 2026-09-23):
+Python 3.12.14, uv 0.12.16, Docker Compose v5.4.0, kfp SDK 2.17.0 +
+kfp-kubernetes 2.17.0, KFP backend 2.17.2 (standalone,
+platform-agnostic manifests), mlflow 3.16.1, scikit-learn 1.9.1,
+librdkafka 2.15.1 (via confluent-kafka), Postgres 16.15. Pinned for the
+M10 budget: KEDA v2.21.0, metrics-server v0.9.0 (not installed).
 
 ## Current known failures / gaps
 
-- Compose and k8s carry the same env keys in two places (drift risk).
-- NodePorts reuse Compose host ports: the two runtimes are mutually
-  exclusive for the four moved services (by design, documented).
-- No metrics-server / `kubectl top` yet (Milestone 10 needs it for HPA).
-- A stalled ingestor is restarted, not fixed — the dependency still has
-  to be repaired by the operator (runbook).
-- Simulator/ingestor RED metrics from spans are sampled (2%); their own
-  `/metrics` counters remain exact.
-- Docker page cache inflates the kind node's apparent memory.
-- Carried: shared admin token; synchronous persist/publish; promotion
-  on own test split; Redis growth; third-party logs not in Loki; no
-  alerts; CI integration covers ingestion only.
+- **M10 does not fit the 3 GiB k8s node** (projected 3.24–3.79 GiB
+  anon). The proposed `scale` mode (4.5 GiB cap, no Airflow, bounded
+  librdkafka and pools) is awaiting approval (ADR-0012).
+- Unbounded consumers: MinIO (all modes); Redis (no `maxmemory`, 1.38
+  GiB used, **425 MiB in swap**), Airflow (1.28 GiB) and ingress-nginx
+  (322 MiB) in k8s mode.
+- The 75% cap margin is a heuristic, not a measured boundary.
+- 28 `max` events on the node during the kfp run: re-check with 250 ms
+  sampling on the next KFP training run.
+- KFP brings its own MySQL and SeaweedFS; `amel-secrets` is duplicated
+  into `kubeflow`; the `:local` image tag works only on this machine.
+- Carried from M8: env keys duplicated across Compose and k8s; a stalled
+  ingestor is restarted, not fixed; sampled RED for the two Kafka-heavy
+  services; shared admin token; synchronous persist/publish; promotion
+  on its own test split; third-party logs not in Loki; no alerts; CI
+  integration covers ingestion only.
 
 ## Commands that work today
 
 ```bash
-make install · make lint / fmt / typecheck / test (92 tests)
-make up / logs / down                              # Compose (all 20 containers)
-make k8s-up                                        # kind next to Compose; moves the 4 stateless services
-make k8s-status · make k8s-validate · make k8s-down
-kubectl -n amel get pods,svc,ingress,jobs · kubectl -n amel get events --sort-by=.lastTimestamp
-curl -s localhost:8003/model · curl -s amel.localtest.me/ready
-make smoke · make feast-demo · make train · make promote DECIDED_BY=you · make smoke-tracing   # all work in either runtime
-docker stats --no-stream amel-control-plane; docker exec amel-control-plane cat /sys/fs/cgroup/memory.stat | grep ^anon
+make install · make lint / fmt / typecheck / test (96 tests)
+make mode                                          # current mode or violations — run this first after any Docker restart
+make mode-compose · make mode-k8s · make mode-kfp  # the only way to switch (ADR-0012)
+make kfp-up · make kfp-submit · make kfp-down      # kfp mode; kfp-submit needs: kubectl -n kubeflow port-forward svc/ml-pipeline-ui 8888:80
+make pipeline-compile · pipeline-run-steps · pipeline-run-docker
+make k8s-status · make k8s-validate
+make smoke · make feast-demo · make train · make promote DECIDED_BY=you · make smoke-tracing
+scripts/mem_sample.sh /tmp/r.tsv 300 2 0.25 60     # memory sampling (budget from anon+shmem, never docker stats)
 ```
 
 ## Next task
 
-**Milestone 9 — Kubeflow Pipelines v2.** Acceptance: training executes
-as containerized KFP components and records results in MLflow.
-Components per the kickoff: `load_training_dataset`,
-`validate_training_dataset`, `split_dataset`, `train_model`,
-`evaluate_model`, `register_model`; compile to YAML; document how KFP
-turns components into Kubernetes workloads. Memory plan first: a full
-KFP install (pipelines API server, MySQL, MinIO, Argo/workflow
-controller, metadata service) is ~2–3 GB on top of the 3 GB kind cap —
-options are (i) raise the node cap and stop Airflow/Grafana while KFP
-runs, (ii) the lighter "KFP standalone" deployment, or (iii) compile the
-pipeline and run components with a local runner while proving the
-container images and the MLflow recording. Decide and measure before
-installing; the training container image already exists.
+**Milestone 10 — HPA + KEDA scaling experiment.** Acceptance: inference
+can scale and Kafka consumer scaling can be demonstrated.
+**Blocked on approval of the M10 memory budget** (ADR-0012). Once it is
+approved, the first steps measure before anything scales out:
+1. Bound the ingestor's librdkafka queue and fetch sizes, and the
+   SQLAlchemy pools of the scaled services.
+2. Add a `scale` mode to `mode.sh`.
+3. Measure one ingestor draining a deliberate backlog (250 ms sampling).
+4. Install metrics-server and KEDA with explicit limits, and measure
+   them.
+5. Only then raise the maximum replica counts.

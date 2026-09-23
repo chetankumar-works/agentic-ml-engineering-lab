@@ -531,6 +531,45 @@ group** for an hour.
   terminate. The node is still a valid kfp mode. Look at `kubectl get ns
   kubeflow -o yaml` (conditions, finalizers) before retrying. Never lower
   the cap by hand while `kubeflow` exists.
-- Memory numbers: use cgroup `anon` (+`shmem`), not `docker stats`, which
-  counts page cache. Postgres showed 3.74 GiB in `docker stats` with
-  60 MiB anon.
+- Memory numbers: see "Measuring memory" below. Never budget from
+  `docker stats`.
+
+## Measuring memory: `docker stats` vs cgroup anon + shmem
+
+**Rule: budgets (DECISIONS.md ADR-0012) are derived only from cgroup
+`anon` + `shmem`. `docker stats`, `memory.current` and `free`'s "used"
+all include page cache, and page cache is not demand.**
+
+- Why the numbers differ: a container's cgroup is charged for the page
+  cache of the files it reads. `docker stats` = `memory.current` minus
+  *inactive* file pages, so recently read data counts as "usage". The
+  kernel reclaims clean page cache under pressure; it does not reclaim
+  `anon` (heap, stacks, Python objects, JVM heap) or `shmem` (Postgres
+  shared_buffers) without swap.
+- The case that got this wrong: Postgres showed **3.74 GiB** in `docker
+  stats` with **60 MiB anon + 138 MiB shmem**. The other 3.84 GiB was the
+  page cache of its 11 GB database. The M7 "Postgres 1.4–2.4 GB warm"
+  figure was this, and an entire mode budget was argued from it before
+  it was caught.
+- Read one container (from WSL, no cluster API needed):
+  ```bash
+  d=/sys/fs/cgroup/docker/$(docker inspect -f '{{.Id}}' amel-postgres-1)
+  grep -E '^(anon|shmem|file) ' $d/memory.stat     # budget = anon + shmem
+  cat $d/memory.current $d/memory.max $d/memory.pressure $d/memory.events
+  cat $d/memory.swap.current                        # swapped-out anon is still demand
+  ```
+  Pods on the kind node: `$d/kubelet.slice/kubelet-kubepods.slice/…/
+  *pod<uid with _>.slice` under the node container's cgroup.
+- Over time, across everything: `scripts/mem_sample.sh OUT DURATION
+  [INTERVAL] [FAST FAST_FOR]`, e.g. `scripts/mem_sample.sh /tmp/r.tsv
+  300 2 0.25 60` (250 ms for the first minute). It is read-only and
+  covers the VM, the node, every `amel` pod and every Compose container.
+  The TSV has anon, shmem, file, current, full PSI and `max` events.
+- Signs that page cache is *not* harmless: `full avg10` > 0 in
+  `memory.pressure`, `pgmajfault` climbing in `memory.stat`, or
+  `memory.current` pinned at `memory.max`. That is the livelock
+  signature: the hot file set (executables, libraries) is being evicted
+  and re-read.
+- Swap counts: Redis showed 1.0 GiB resident but `used_memory` 1.38 GiB
+  (425 MiB in `memory.swap.current`). For services with their own
+  accounting (Redis `INFO memory`, JVM heap), take the larger number.
