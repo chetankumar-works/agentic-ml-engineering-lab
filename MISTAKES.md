@@ -470,3 +470,23 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
 
 ### KFP 2.17 has no `minio` Deployment
 - **Fix**: wait for `seaweedfs` instead — the artifact store changed.
+
+### `kfp_down.sh` lowered the node cap with KFP still installed
+- **What happened**: after a Docker Desktop restart the kind node sat at
+  exactly its 3 GiB cap with KFP's MySQL, SeaweedFS, UI and metadata
+  writer still running: `memory.pressure full avg10=83%`, 517k major
+  faults, about 10 cores busy, zero OOM kills. The node livelocked
+  instead of failing.
+- **Root cause**: both `kubectl delete -k` lines ended in
+  `>/dev/null 2>&1 || true`, so a failed delete was invisible, and the
+  script then ran `docker update --memory 3g` unconditionally. A
+  container cap protects the VM from running out of memory, but not the
+  container from thrashing.
+- **Fix**: the deletes fail loudly. The script waits (with a timeout)
+  until `kubectl get namespace kubeflow --ignore-not-found` is empty,
+  and only then lowers the cap. The namespace check is a bare
+  assignment, because `set -e` ignores a failing `$(…)` inside `[ … ]`;
+  the first version of the fix had exactly that hole, and a stub test
+  with the API down caught it. Stub tests cover a failed delete, the API
+  down at the start and mid-wait, a stuck namespace and the normal path.
+  Mode separation: DECISIONS.md ADR-0012.

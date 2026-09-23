@@ -754,3 +754,98 @@ the pipeline root from the host and needs the Compose network.
 in-cluster MySQL/SeaweedFS with Postgres/MinIO if KFP becomes the only
 orchestrator. Add caching (`enable_caching`) once dataset fingerprints
 are stable across runs.
+
+## ADR-0012: Compose and kind run as mutually exclusive modes; the full Compose stack never runs next to the cluster
+
+Supersedes the "next to Compose" part of ADR-0010 and the memory plan in
+ADR-0011 (`kfp_up.sh` stopping four Compose services).
+
+**Status (2026-09-23).** Decided. The `kfp_down.sh` fix is implemented;
+the `mode-*` targets and the up-script guards are not built yet and must
+exist before the cluster is started again.
+
+**Problem.** The host is a 15 GB WSL2 VM (MemTotal 15.47 GiB, 4 GiB
+swap). The full Compose stack and the kind node ran side by side, and
+the machine wedged three times in three days. The fourth case was
+measured on 2026-09-23. `kfp_down.sh` had swallowed a failed `kubectl
+delete` (`|| true`) and lowered the node cap to 3 GiB with KFP still
+installed. After a Docker restart the node sat at its cap
+(`memory.current == memory.max`, anon 2.47 GiB, file 0.47 GiB) with
+`memory.pressure full avg10=83%`, 517k major faults, about 10 cores busy
+and **zero OOM kills**. A container cap stops the VM from running out of
+memory, but not a livelock inside the container: the kernel keeps
+evicting and re-reading executable pages instead of killing a process.
+
+**Options considered.**
+- (a) Compose and kind are mutually exclusive modes, with make targets
+  to switch between them and a documented rule that the full stack and
+  the cluster never run together.
+- (b) Move every service into the cluster for M8+ and retire Compose
+  for those milestones.
+
+**Decision.** (a), with one precision: "exclusive" is between the
+*full* Compose stack and the cluster. Since ADR-0010 the in-cluster pods
+reach Postgres, Kafka, Redis and MLflow by their Compose names, so each
+cluster mode names the exact Compose services it keeps, and nothing
+else runs.
+
+| mode | kind node | Compose runs | measured |
+|---|---|---|---|
+| `compose` (M1–M7 work) | none | full stack | 8–9 GB VM used (M7) |
+| `k8s` (M8) | cap 3 GiB, the four stateless services | everything except the four moved services | 8.9 GB used, 6.9 GB available (M8) |
+| `kfp` (M9) | cap 6 GiB, KFP; the four M8 Deployments scaled to 0 | postgres, minio, mlflow only | see budget below |
+
+Make targets `mode-compose`, `mode-k8s`, `mode-kfp` switch modes: stop
+what the target mode excludes and verify it stopped, then start what it
+needs. `make mode` prints the current mode from `docker ps`. `kfp_up.sh`
+and `k8s_up.sh` refuse to start when a service outside their mode's
+list is running. `kfp_down.sh` lowers the cap only after the `kubeflow`
+namespace is verified gone, and any failure exits non-zero with the cap
+unchanged.
+
+**Budget for `kfp` mode.** Today's figures were measured on 2026-09-23;
+the others are earlier measurements recorded in LEARNING_LOG.md.
+- VM overhead outside containers (kernel, dockerd, WSL): about 1.35 GiB
+  (4.71 GiB used minus 3.40 GiB of containers, measured today with the
+  node stopped).
+- Kind node: hard cap 6 GiB. Expected demand: KFP idle at 2.8 GB (M9,
+  at a 6 GB cap). At a 3 GiB cap it is squeezed to 2.47 GiB anon plus
+  0.37 GiB active file, measured today. On top of that, one task pod at
+  a time with a 2 GiB limit (`pipeline.py`). Peak is about 5.2 GiB.
+  **Not measured: a training run inside the node.**
+- Compose in this mode: MLflow ≤ 1 GiB (capped; 0.60 today), MinIO 0.10
+  GiB, Postgres 0.12 GiB cold and 1.4–2.4 GB warm (M7; **uncapped**).
+  Upper bound about 3.5 GiB.
+- Total ≤ 1.35 + 6 + 3.5 = **10.9 GiB of 15.47, at least 4.6 GiB of
+  headroom**.
+- The combination this rules out: the full stack at 8–9 GB used plus a
+  6 GiB node is 14–15 GiB before any task pod runs.
+
+**Reason.**
+- (b) does not reduce memory. It moves the same processes (Postgres
+  1.4–2.4 GB warm, Airflow 1.85 GB, Kafka 1.1–1.4 GB, Redis 1.3 GB) into
+  one node cgroup. The node would then need a cap of 10 GiB or more,
+  and today's measurement shows what happens when that one cgroup
+  reaches its cap: everything inside stalls together and nothing is
+  killed.
+- (b) also costs StatefulSets, PVs, an Airflow chart and in-cluster
+  observability for a single-node cluster. ADR-0010 already set the
+  trigger for moving stateful services: a multi-node or managed
+  cluster.
+- (a) turns the budget into a per-mode sum of capped items. It can be
+  checked before switching modes instead of being discovered when the
+  VM freezes.
+
+**Tradeoffs.** Switching modes costs restarts: a cold Postgres, Kafka
+consumer lag, and the simulator resuming from its start index. Anything
+that exercises the Compose-only services (Airflow DAGs, Grafana
+dashboards) is unavailable in `kfp` mode, so demos that need both
+happen sequentially. Postgres and MinIO are still uncapped, and the
+`kfp` budget depends on Postgres staying under about 2.4 GB.
+
+**Future reconsideration trigger.** Measure the node during a real KFP
+training run. If the peak exceeds 5.5 GiB, raise the cap only if the
+sum still leaves at least 3 GiB of headroom; otherwise lower the task
+pod limit. Give Postgres a `mem_limit` once its warm peak under the
+training read is measured. M10 (KEDA/HPA) gets its own mode row and
+budget before it starts.
