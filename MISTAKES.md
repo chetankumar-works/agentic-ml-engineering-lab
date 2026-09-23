@@ -490,3 +490,20 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
   with the API down caught it. Stub tests cover a failed delete, the API
   down at the start and mid-wait, a stuck namespace and the normal path.
   Mode separation: DECISIONS.md ADR-0012.
+
+### The first `kfp_down.sh` fix could never lower the cap (stub encoded my assumption)
+- **What happened**: the first real `make kfp-down` after the fix timed
+  out after 300 s: "namespace kubeflow still present; node cap NOT
+  lowered". It failed safe (cap stayed 6g, still a valid kfp mode) but
+  never finished.
+- **Root cause**: the fix waited for the namespace between the two
+  deletes. The `kubeflow` Namespace object is in
+  `cluster-scoped-resources` (1 of 16 objects; 0 of 72 in
+  `platform-agnostic`), so it cannot terminate until the second delete.
+  The stub test passed because the stub made the namespace disappear
+  after the first delete, which was my assumption, not KFP's behaviour.
+- **Fix**: delete both, then wait, then lower the cap (gone in 47 s).
+  The stub now removes the namespace only after the cluster-scoped
+  delete, and it fails the old order. Lesson: a stub has to model the
+  real system's ownership, checked against `kubectl kustomize`, not
+  against the script it tests.

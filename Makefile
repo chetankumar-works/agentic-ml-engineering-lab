@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing k8s-up k8s-down k8s-status k8s-validate pipeline-compile pipeline-run-steps pipeline-run-docker kfp-up kfp-down kfp-submit
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing mode mode-compose mode-k8s mode-kfp k8s-up k8s-down k8s-status k8s-validate pipeline-compile pipeline-run-steps pipeline-run-docker kfp-up kfp-down kfp-submit
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -68,6 +68,20 @@ model-show:          # current candidate/champion from the registry
 smoke-tracing:       # one prediction traced end to end: response -> Tempo -> Loki -> Postgres
 	uv run python scripts/smoke_milestone6.py
 
+# --- Compose/kind modes (DECISIONS.md ADR-0012): never the full stack and the cluster together ---
+
+mode:                # current mode and any violation
+	./scripts/mode.sh status
+
+mode-compose:        # stop the kind node, full Compose stack
+	./scripts/mode.sh compose
+
+mode-k8s:            # node at 3g (KFP removed first if present), Compose minus the four moved services
+	./scripts/mode.sh k8s
+
+mode-kfp:            # node at 6g, Compose trimmed to postgres/minio/mlflow, amel Deployments at 0
+	./scripts/mode.sh kfp
+
 # --- Kubernetes on kind (Milestone 8) ---
 
 k8s-up:              # kind cluster next to Compose; moves inference-api, feast-server, simulator, ingestor
@@ -94,10 +108,10 @@ pipeline-run-steps:  # the six steps in-process inside the training container (n
 pipeline-run-docker: # compiled components, one container per task, via kfp.local DockerRunner
 	uv run amel-pipeline run-docker --max-rows $(or $(TRAINING_MAX_ROWS),100000) $(if $(TRAINING_AS_OF),--as-of $(TRAINING_AS_OF),) --git-sha $(GIT_SHA)
 
-kfp-up:              # KFP 2.17 standalone on the kind cluster (raises node cap to 6g, stops airflow/grafana/loki/tempo)
+kfp-up:              # KFP 2.17 standalone on the kind cluster (needs: make mode-kfp)
 	./scripts/kfp_up.sh
 
-kfp-down:
+kfp-down:            # remove KFP, verify the namespace is gone, node cap back to 3g
 	./scripts/kfp_down.sh
 
 kfp-submit:          # submit to the in-cluster API server (needs: kubectl -n kubeflow port-forward svc/ml-pipeline-ui 8888:80)

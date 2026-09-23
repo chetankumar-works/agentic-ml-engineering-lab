@@ -60,7 +60,8 @@ make model-show                # current candidate/champion
 make smoke-tracing             # Milestone 6: one prediction traced response -> Tempo -> Loki -> Postgres
 make k8s-up / k8s-down / k8s-status / k8s-validate   # Milestone 8: kind cluster for the stateless services
 make pipeline-compile / pipeline-run-steps / pipeline-run-docker   # Milestone 9: KFP v2 pipeline, local runners
-make kfp-up / kfp-submit / kfp-down                  # Milestone 9: KFP standalone on kind (memory plan inside)
+make mode / mode-compose / mode-k8s / mode-kfp      # Compose/kind modes — never the full stack and the cluster together (ADR-0012)
+make kfp-up / kfp-submit / kfp-down                  # Milestone 9: KFP standalone on kind (in kfp mode)
 make down          # stop everything
 ```
 

@@ -498,7 +498,8 @@ group** for an hour.
   logs <pod> -c main | grep -v '^I0'`.
 - Control-plane memory: `docker exec amel-control-plane cat
   /sys/fs/cgroup/memory.stat | grep ^anon`; the node cap is 6 GB while
-  KFP is installed (`scripts/kfp_down.sh` restores 3 GB).
+  KFP is installed (`scripts/kfp_down.sh` restores 3 GB). Only in kfp
+  mode (`make mode-kfp`; DECISIONS.md ADR-0012).
 
 ## `amel-pipeline run-docker` fails before the first task
 
@@ -509,3 +510,27 @@ group** for an hour.
   as the invoking user and runs tasks as that uid.
 - Name resolution for `postgres`/`mlflow`: the runner uses
   `--network amel_default`; the Compose stack must be up.
+
+## Compose/kind modes and the memory budget (ADR-0012)
+
+- Rule: the full Compose stack and the kind node never run together.
+  `make mode` shows the current mode (`compose`, `k8s`, `kfp`) or lists
+  every violation. Switch only with `make mode-compose|mode-k8s|mode-kfp`.
+- After a Docker Desktop restart, containers come back as they were.
+  Run `make mode` before anything else. `mode: NONE` means fix it with a
+  mode target first.
+- Node livelock signature: `memory.current == memory.max`, `full avg10`
+  well above 0 and `oom_kill 0`, readable from the WSL side without the
+  cluster API:
+  `d=/sys/fs/cgroup/docker/$(docker inspect -f '{{.Id}}' amel-control-plane);
+  cat $d/memory.max $d/memory.current $d/memory.pressure $d/memory.events;
+  grep -E '^(anon|file) ' $d/memory.stat`.
+  Recovery: `docker stop amel-control-plane`, then `make mode-k8s`,
+  which starts the node inside the 6g envelope and removes KFP first.
+- `kfp-down` exits 1 with "node cap NOT lowered": the namespace did not
+  terminate. The node is still a valid kfp mode. Look at `kubectl get ns
+  kubeflow -o yaml` (conditions, finalizers) before retrying. Never lower
+  the cap by hand while `kubeflow` exists.
+- Memory numbers: use cgroup `anon` (+`shmem`), not `docker stats`, which
+  counts page cache. Postgres showed 3.74 GiB in `docker stats` with
+  60 MiB anon.

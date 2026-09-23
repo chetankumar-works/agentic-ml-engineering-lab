@@ -25,6 +25,12 @@ if ! kind get clusters 2>/dev/null | grep -qx amel; then
     --config infra/k8s/kind-config.yaml --wait 120s
 else
   echo "   already exists"
+  # A stopped node may hold KFP; starting it here at the 3g cap would
+  # livelock it (ADR-0012). mode.sh starts it inside the kfp envelope.
+  [ "$(docker inspect -f '{{.State.Running}}' amel-control-plane)" = true ] \
+    || { echo "node is stopped: use make mode-k8s" >&2; exit 1; }
+  ns=$(kubectl get namespace kubeflow --ignore-not-found -o name)
+  [ -z "$ns" ] || { echo "KFP is installed: run make kfp-down first" >&2; exit 1; }
 fi
 docker update --memory "$NODE_MEMORY" --memory-swap "$NODE_MEMORY" amel-control-plane >/dev/null
 echo "   node capped at $NODE_MEMORY"

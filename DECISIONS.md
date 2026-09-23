@@ -760,21 +760,24 @@ are stable across runs.
 Supersedes the "next to Compose" part of ADR-0010 and the memory plan in
 ADR-0011 (`kfp_up.sh` stopping four Compose services).
 
-**Status (2026-09-23).** Decided. The `kfp_down.sh` fix is implemented;
-the `mode-*` targets and the up-script guards are not built yet and must
-exist before the cluster is started again.
+**Status (2026-09-23).** Decided and implemented: `scripts/mode.sh`,
+`make mode | mode-compose | mode-k8s | mode-kfp`, guards in `kfp_up.sh`
+and `k8s_up.sh`, `kfp_down.sh` verification, and Postgres bounded by its
+own settings. Every transition was run for real (compose → kfp → training
+run → kfp-down → k8s). The budget numbers below are measured.
 
 **Problem.** The host is a 15 GB WSL2 VM (MemTotal 15.47 GiB, 4 GiB
 swap). The full Compose stack and the kind node ran side by side, and
 the machine wedged three times in three days. The fourth case was
-measured on 2026-09-23. `kfp_down.sh` had swallowed a failed `kubectl
-delete` (`|| true`) and lowered the node cap to 3 GiB with KFP still
-installed. After a Docker restart the node sat at its cap
-(`memory.current == memory.max`, anon 2.47 GiB, file 0.47 GiB) with
-`memory.pressure full avg10=83%`, 517k major faults, about 10 cores busy
-and **zero OOM kills**. A container cap stops the VM from running out of
-memory, but not a livelock inside the container: the kernel keeps
-evicting and re-reading executable pages instead of killing a process.
+measured. `kfp_down.sh` had swallowed a failed `kubectl delete` (`||
+true`) and lowered the node cap to 3 GiB with KFP still installed. After
+a Docker restart the node sat at its cap (`memory.current ==
+memory.max`, anon 2.47 GiB, file 0.47 GiB) with `memory.pressure full
+avg10=83%`, 517k major faults, about 10 cores busy and **zero OOM
+kills**. KFP pods ran up 30–40 liveness restarts each. A cgroup cap stops
+the VM from running out of memory, but not a livelock inside the
+container: the kernel keeps evicting and re-reading executable pages
+instead of killing a process.
 
 **Options considered.**
 - (a) Compose and kind are mutually exclusive modes, with make targets
@@ -786,66 +789,120 @@ evicting and re-reading executable pages instead of killing a process.
 **Decision.** (a), with one precision: "exclusive" is between the
 *full* Compose stack and the cluster. Since ADR-0010 the in-cluster pods
 reach Postgres, Kafka, Redis and MLflow by their Compose names, so each
-cluster mode names the exact Compose services it keeps, and nothing
-else runs.
+cluster mode names the exact Compose services it keeps. The node's
+memory cap identifies the mode.
 
-| mode | kind node | Compose runs | measured |
+| mode | kind node | Compose runs | measured VM (2026-09-23) |
 |---|---|---|---|
-| `compose` (M1–M7 work) | none | full stack | 8–9 GB VM used (M7) |
-| `k8s` (M8) | cap 3 GiB, the four stateless services | everything except the four moved services | 8.9 GB used, 6.9 GB available (M8) |
-| `kfp` (M9) | cap 6 GiB, KFP; the four M8 Deployments scaled to 0 | postgres, minio, mlflow only | see budget below |
+| `compose` | stopped or absent | full stack (16 long-running) | 7.96 GB used, 7.9 GB available |
+| `k8s` | running, cap 3 GiB, no KFP; the four stateless services | everything except the four moved services | 8.68 GB used, 7.16 GB available; node anon 1.61 GiB, PSI 0 |
+| `kfp` | running, cap 6 GiB; M8 Deployments scaled to 0 | postgres, minio, mlflow | ≥ 10.1 GB available throughout a training run |
 
-Make targets `mode-compose`, `mode-k8s`, `mode-kfp` switch modes: stop
-what the target mode excludes and verify it stopped, then start what it
-needs. `make mode` prints the current mode from `docker ps`. `kfp_up.sh`
-and `k8s_up.sh` refuse to start when a service outside their mode's
-list is running. `kfp_down.sh` lowers the cap only after the `kubeflow`
-namespace is verified gone, and any failure exits non-zero with the cap
-unchanged.
+1. `make mode` reports the mode, or every violation when the running set
+   matches none.
+2. `mode-compose` stops the node and starts the full stack.
+3. `mode-kfp` stops every Compose service outside its set and verifies
+   they stopped, then raises the cap to 6g, starts the node and scales
+   the `amel` Deployments to 0.
+4. `mode-k8s` starts a node that may still hold KFP only inside the kfp
+   envelope (Compose trimmed, cap 6g). It removes KFP via `kfp_down.sh`
+   if present, then lowers the cap to 3g and hands off to `k8s_up.sh`.
+   So the worst case at every step is the kfp budget, never "full stack
+   + 6g node".
+5. Guards: `kfp_up.sh` runs `mode.sh check kfp`. `k8s_up.sh` refuses a
+   stopped node or an installed KFP. Every "is KFP installed" check
+   treats an unreachable API as an error, not as "no".
+6. `kfp_down.sh` deletes both kustomizations. The `kubeflow` Namespace
+   object lives in `cluster-scoped-resources`, so it only terminates
+   after the second delete. The script then waits for the namespace to
+   be gone (300 s timeout) and only then lowers the cap. Measured: gone
+   in 47 s.
+7. **Postgres is bounded by its own settings, not a cgroup cap** (a cap
+   at its limit stalls instead of failing). The settings are `command:`
+   flags in Compose:
 
-**Budget for `kfp` mode.** Today's figures were measured on 2026-09-23;
-the others are earlier measurements recorded in LEARNING_LOG.md.
-- VM overhead outside containers (kernel, dockerd, WSL): about 1.35 GiB
-  (4.71 GiB used minus 3.40 GiB of containers, measured today with the
-  node stopped).
-- Kind node: hard cap 6 GiB. Expected demand: KFP idle at 2.8 GB (M9,
-  at a 6 GB cap). At a 3 GiB cap it is squeezed to 2.47 GiB anon plus
-  0.37 GiB active file, measured today. On top of that, one task pod at
-  a time with a 2 GiB limit (`pipeline.py`). Peak is about 5.2 GiB.
-  **Not measured: a training run inside the node.**
-- Compose in this mode: MLflow ≤ 1 GiB (capped; 0.60 today), MinIO 0.10
-  GiB, Postgres 0.12 GiB cold and 1.4–2.4 GB warm (M7; **uncapped**).
-  Upper bound about 3.5 GiB.
-- Total ≤ 1.35 + 6 + 3.5 = **10.9 GiB of 15.47, at least 4.6 GiB of
-  headroom**.
-- The combination this rules out: the full stack at 8–9 GB used plus a
-  6 GiB node is 14–15 GiB before any task pod runs.
+| setting | was | now | why |
+|---|---|---|---|
+| shared_buffers | 128MB (initdb conf) | 128MB, explicit | fixed shared cost; the OS page cache does the caching |
+| max_connections | 100 | 50 | the multiplier on backend memory; measured full-stack peak 23 (Airflow 12, MLflow 4, ingestor 1–2, Feast 1) |
+| work_mem × hash_mem_multiplier | 4MB × 2 | same, explicit | per sort/hash node; larger sorts spill to disk (they did) |
+| max_parallel_workers | 8 | 2 | each worker gets its own work_mem; caps them server-wide |
+| max_parallel_workers_per_gather | 2 | 2, explicit | |
+| maintenance_work_mem, autovacuum_work_mem | 64MB, -1 (= 64MB) | 64MB each, explicit | × autovacuum_max_workers 3 |
+| jit | on | off | LLVM compilation memory on large analytic queries |
+
+   Private-memory bound: shmem ~140 MiB + 50 backends × ~3 MiB +
+   (active heavy queries × ~5 nodes × 8 MiB × 3 processes) + autovacuum
+   3 × 64 MiB ≈ **0.7 GiB with two heavy concurrent queries**. This is a
+   bound by construction, not enforcement: Postgres has no global limit,
+   and work_mem applies per node, per process. `max_connections` and
+   `max_parallel_workers` are the hard multipliers.
+
+**What the "2.4 GB Postgres" figure was.** Postgres's cgroup is charged
+for the page cache of its data files, and `docker stats` includes active
+page cache. In compose mode `docker stats` showed Postgres at 3.74 GiB,
+of which anon was 60 MiB, shmem 138 MiB and **file 3.84 GiB**. The M7
+"1.4–2.4 GB" was page cache from an 11 GB database. It is reclaimable
+and not demand in the sense that exhausts a VM.
+
+**Budget for `kfp` mode, measured.** Measured during a 100k-row KFP
+training run (run `08e728c7`, SUCCEEDED, 3m46s, sampled every 2 s, 103
+samples). The budget counts non-reclaimable memory (anon + shmem); page
+cache is listed separately.
+
+| item | warm peak, anon + shmem | page cache on top (peak) | bound |
+|---|---|---|---|
+| VM overhead (kernel, dockerd, WSL) | ~1.35 GiB (derived: VM used minus containers, node stopped) | – | – |
+| kind node: KFP (14 pods) + one task pod | anon 2.92 GiB (idle 1.97) | file up to 2.7 GiB; memory.current peak 5.57 GiB | cap 6 GiB; task pod limit 2G; PSI full 0.00 throughout, 46 ms total stall |
+| Postgres (Feast point-in-time join over 3.3 GB) | 0.17 GiB (anon 40 MiB + shmem 138) | 2.07 GiB | settings above, ≈0.7 GiB |
+| MLflow | 0.57 GiB | 0.3 GiB | cap 1 GiB; peak anon 57% of cap |
+| MinIO | 0.10 GiB | 0.13 GiB | measured only; no internal bound |
+
+- **Compose worst case in `kfp` mode, re-derived from per-service warm
+  peaks:** 0.84 GiB non-reclaimable measured (0.17 + 0.57 + 0.10), or
+  3.26 GiB including page cache. Structural bound: Postgres 0.7 +
+  MLflow 1.0 + MinIO 0.1 = **1.8 GiB**. The earlier 3.5 GiB estimate
+  treated Postgres page cache as demand. It happened to be conservative,
+  but it was not derived correctly.
+- **Total structural bound:** 1.35 + 6 + 1.8 = **9.15 GiB of 15.47,
+  leaving at least 6.3 GiB of headroom**. Measured: VM MemAvailable never
+  fell below 10.1 GB during the run.
+- **The combination this rules out:** the full stack (7.96 GB used) plus
+  a 6 GiB node is 14 GiB before any task pod runs.
+
+**Rule for capped containers.** A cgroup cap is a backstop, not a
+budget. A capped service must have an internal bound whose measured
+peak anon is ≤ 75% of the cap, and its full PSI must stay ~0. The node
+livelocked at 82% anon (2.47 of 3 GiB) plus a hot file set. In `kfp`
+mode it peaks at 49% (2.92 of 6), and in `k8s` mode it sits at 54% (1.61
+of 3).
 
 **Reason.**
-- (b) does not reduce memory. It moves the same processes (Postgres
-  1.4–2.4 GB warm, Airflow 1.85 GB, Kafka 1.1–1.4 GB, Redis 1.3 GB) into
-  one node cgroup. The node would then need a cap of 10 GiB or more,
-  and today's measurement shows what happens when that one cgroup
-  reaches its cap: everything inside stalls together and nothing is
-  killed.
+- (b) does not reduce memory. It moves the same processes (Airflow, Kafka
+  1.1 GiB, Redis 1.3 GiB, Postgres) into one node cgroup, whose cap
+  would have to be 10 GiB or more. The livelock measurement shows what
+  happens when that single cgroup reaches its cap: everything inside
+  stalls together and nothing is killed.
 - (b) also costs StatefulSets, PVs, an Airflow chart and in-cluster
   observability for a single-node cluster. ADR-0010 already set the
-  trigger for moving stateful services: a multi-node or managed
-  cluster.
-- (a) turns the budget into a per-mode sum of capped items. It can be
-  checked before switching modes instead of being discovered when the
-  VM freezes.
+  trigger for moving stateful services: a multi-node or managed cluster.
+- (a) turns the budget into a per-mode sum of bounded items that can be
+  checked before a switch (`make mode`), instead of discovering it when
+  the VM freezes.
 
-**Tradeoffs.** Switching modes costs restarts: a cold Postgres, Kafka
-consumer lag, and the simulator resuming from its start index. Anything
-that exercises the Compose-only services (Airflow DAGs, Grafana
-dashboards) is unavailable in `kfp` mode, so demos that need both
-happen sequentially. Postgres and MinIO are still uncapped, and the
-`kfp` budget depends on Postgres staying under about 2.4 GB.
+**Tradeoffs.** Switching modes costs restarts. Measured transition
+times: compose 22 s, kfp 20 s plus about 1 min for KFP readiness,
+kfp-down 47 s, k8s 5.5 min. Anything that exercises Compose-only
+services (Airflow DAGs, Grafana) is unavailable in `kfp` mode, so demos
+that need both happen sequentially. The Postgres bound holds by
+construction: a workload with many concurrent heavy queries could
+exceed 0.7 GiB. MinIO has no internal bound (0.10 GiB under a training
+run).
 
-**Future reconsideration trigger.** Measure the node during a real KFP
-training run. If the peak exceeds 5.5 GiB, raise the cap only if the
-sum still leaves at least 3 GiB of headroom; otherwise lower the task
-pod limit. Give Postgres a `mem_limit` once its warm peak under the
-training read is measured. M10 (KEDA/HPA) gets its own mode row and
-budget before it starts.
+**Future reconsideration trigger.**
+- Re-measure if the training `max_rows` grows past 100k or the task pod
+  limit changes. The node's anon must stay ≤ 75% of 6 GiB (4.5 GiB).
+- If full-stack Postgres connections approach 40, raise
+  `max_connections` and recompute the bound.
+- M10 (KEDA/HPA, more ingestor replicas) gets its own mode row and
+  measured budget before it starts.

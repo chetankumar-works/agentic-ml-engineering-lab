@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
 # Kubeflow Pipelines standalone on the AMEL kind cluster (Milestone 9,
-# DECISIONS.md ADR-0011). Memory plan: KFP's control plane (API server,
-# MySQL, MinIO, metadata, workflow controller, ...) needs ~2 GB, so the
-# node cap goes 3 -> 6 GB and Compose's Airflow + Grafana/Loki/Tempo
-# (~2.4 GB, not needed while training on KFP) are stopped first.
-# `scripts/kfp_down.sh` reverses it.
+# DECISIONS.md ADR-0011). Runs only in kfp mode (ADR-0012): node cap 6g,
+# Compose trimmed to postgres/minio/mlflow — `make mode-kfp` sets that up.
+# `scripts/kfp_down.sh` reverses the install.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 COMPOSE="docker compose -f infra/docker-compose.yml"
 KFP_VERSION="${KFP_VERSION:-2.17.2}"
-NODE_MEMORY="${KIND_NODE_MEMORY_KFP:-6g}"
 
-kind get clusters | grep -qx amel || { echo "run make k8s-up first"; exit 1; }
-
-echo "== 1. free memory: stopping airflow, grafana, loki, tempo (Compose)"
-$COMPOSE stop airflow grafana loki tempo >/dev/null 2>&1 || true
-docker update --memory "$NODE_MEMORY" --memory-swap "$NODE_MEMORY" amel-control-plane >/dev/null
-echo "   node cap now $NODE_MEMORY"
+echo "== 1. mode check"
+./scripts/mode.sh check kfp
 
 echo "== 2. KFP $KFP_VERSION standalone (cluster-scoped resources, then platform-agnostic env)"
 kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/cluster-scoped-resources?ref=${KFP_VERSION}" >/dev/null

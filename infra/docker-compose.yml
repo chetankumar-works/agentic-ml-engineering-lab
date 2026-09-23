@@ -4,6 +4,35 @@ services:
   postgres:
     restart: unless-stopped
     image: postgres:16-alpine
+    # Memory is bounded inside Postgres, not by a cgroup cap (a cap at its
+    # limit stalls instead of failing — DECISIONS.md ADR-0012). Private
+    # memory ≈ shared_buffers + max_connections × backend overhead +
+    # active sort/hash nodes × work_mem × hash_mem_multiplier × (1 +
+    # parallel workers) + autovacuum_max_workers × autovacuum_work_mem.
+    # Measured full-stack peak 23 connections; docker stats' multi-GB
+    # figure for this container is page cache (reclaimable), not this.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=50
+      - -c
+      - work_mem=4MB
+      - -c
+      - hash_mem_multiplier=2
+      - -c
+      - max_parallel_workers=2
+      - -c
+      - max_parallel_workers_per_gather=2
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - autovacuum_work_mem=64MB
+      - -c
+      - autovacuum_max_workers=3
+      - -c
+      - jit=off
     environment:
       POSTGRES_USER: amel
       POSTGRES_PASSWORD: amel_dev_password
