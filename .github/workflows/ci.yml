@@ -36,6 +36,8 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy .
       - run: uv run pytest -q
+      - name: KFP pipeline compiles (Milestone 9)
+        run: uv run amel-pipeline compile --out /tmp/higgs_training_pipeline.yaml
 
   compose-config:
     name: docker compose config

@@ -481,3 +481,31 @@ group** for an hour.
 - Fix: keep `OTEL_TRACES_SAMPLER_ARG` low for those services
   (`OTEL_KAFKA_TRACE_RATIO`, default 0.02) — they are set in Compose and
   in the k8s Deployments; Tempo has 768 MB.
+
+## KFP task pod fails or never starts
+
+- `ImagePullBackOff` on `amel-training:*`: the image lives only in the
+  kind node. Never use `:latest` for it (pull policy Always); `kind load
+  docker-image amel-training:local --name amel` after rebuilding.
+- `DATABASE_URL is not set` in the `main` container log: the
+  `amel-secrets` Secret is missing in the `kubeflow` namespace
+  (`scripts/kfp_up.sh` creates it) or the task lost its
+  `use_secret_as_env` mapping in `pipeline.py`.
+- `invalid choice: 'sh'`: an image ENTRYPOINT is swallowing the KFP
+  executor command — the training image must have none.
+- Reading logs: `kubectl -n kubeflow get pods --sort-by=
+  .metadata.creationTimestamp | grep impl`, then `kubectl -n kubeflow
+  logs <pod> -c main | grep -v '^I0'`.
+- Control-plane memory: `docker exec amel-control-plane cat
+  /sys/fs/cgroup/memory.stat | grep ^anon`; the node cap is 6 GB while
+  KFP is installed (`scripts/kfp_down.sh` restores 3 GB).
+
+## `amel-pipeline run-docker` fails before the first task
+
+- `pull access denied for amel-training`: build it (`docker compose
+  --profile train build train`) — the runner does not build.
+- `PermissionError … amel-kfp-local`: a stale root-owned pipeline root;
+  delete it (`rm -rf ~/.cache/amel-kfp-local`) — the CLI now creates it
+  as the invoking user and runs tasks as that uid.
+- Name resolution for `postgres`/`mlflow`: the runner uses
+  `--network amel_default`; the Compose stack must be up.

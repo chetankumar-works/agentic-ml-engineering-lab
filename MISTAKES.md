@@ -433,3 +433,40 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
   the smoke requires one up per job.
 - **Lesson**: static scrape configs encode topology; every topology
   change must revisit them (or move to service discovery).
+
+## Milestone 9 — Kubeflow Pipelines v2
+
+### `@dsl.component` could not read the type hints
+- **What happened**: `TypeError: Artifacts must have both a schema_title
+  and a schema_version … Got: Output[Dataset]`.
+- **Root cause**: `from __future__ import annotations` turns hints into
+  strings; KFP needs the objects.
+- **Fix**: no postponed annotations in `pipeline.py` (comment explains).
+
+### The image's ENTRYPOINT ate the executor command
+- **What happened**: every task died with `amel-train: error: argument
+  command: invalid choice: 'sh'`.
+- **Root cause**: `ENTRYPOINT ["amel-train"]` prepends to whatever KFP
+  passes (`sh -c … executor_main`).
+- **Fix**: `CMD ["amel-train", "train"]` instead; callers pass full
+  commands.
+
+### `ImagePullBackOff` for a locally built image
+- **Root cause**: `:latest` implies `imagePullPolicy: Always`; the pod
+  asked Docker Hub for `docker.io/library/amel-training:latest`.
+- **Fix**: tag `amel-training:local` everywhere.
+
+### The task pod had no `DATABASE_URL`
+- **Root cause**: Compose injected it; nothing in the pipeline did.
+- **Fix**: `kubernetes.use_secret_as_env(...)` from the `amel-secrets`
+  Secret (created in the `kubeflow` namespace by `kfp_up.sh`); the
+  Docker runner injects the same variable itself.
+
+### A stale root-owned pipeline root blocked every container
+- **Root cause**: the very first (entrypoint-broken) run created
+  `/tmp/amel-kfp-local` as root; later tasks ran as uid 1000.
+- **Fix**: user-owned root under `~/.cache`, containers run as the
+  invoking uid.
+
+### KFP 2.17 has no `minio` Deployment
+- **Fix**: wait for `seaweedfs` instead — the artifact store changed.

@@ -19,10 +19,10 @@ project is built against, `ARCHITECTURE.md` for the system design,
 
 ## Status
 
-Milestone 8 (the four stateless services on a kind cluster next to
-Compose — probes, ConfigMap/Secret, Jobs, Ingress, a 3 GB node cap —
-with a stall watchdog added after a frozen database fooled liveness) on
-top of Milestone 7's hardened Compose stack and CI, Milestone 6's observability stack, Milestone 5's FastAPI
+Milestone 9 (the training workflow as six containerized Kubeflow
+Pipelines v2 components — same code as `amel-train`, run in-process, as
+local containers, or on KFP inside the kind cluster, all recording to
+MLflow) on top of Milestone 8's kind cluster, Milestone 7's hardened Compose stack and CI, Milestone 6's observability stack, Milestone 5's FastAPI
 inference API, Milestone 4's reproducible training + MLflow
 registry, Milestone 3's Feast/Redis feature store, Milestone
 2's Airflow + MinIO batch pipeline and Milestone 1's PostgreSQL + Kafka
@@ -59,6 +59,8 @@ make promote DECIDED_BY=you    # explicit, audited candidate -> champion (exit 2
 make model-show                # current candidate/champion
 make smoke-tracing             # Milestone 6: one prediction traced response -> Tempo -> Loki -> Postgres
 make k8s-up / k8s-down / k8s-status / k8s-validate   # Milestone 8: kind cluster for the stateless services
+make pipeline-compile / pipeline-run-steps / pipeline-run-docker   # Milestone 9: KFP v2 pipeline, local runners
+make kfp-up / kfp-submit / kfp-down                  # Milestone 9: KFP standalone on kind (memory plan inside)
 make down          # stop everything
 ```
 

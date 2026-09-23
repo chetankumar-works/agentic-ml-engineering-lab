@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing k8s-up k8s-down k8s-status k8s-validate
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing k8s-up k8s-down k8s-status k8s-validate pipeline-compile pipeline-run-steps pipeline-run-docker kfp-up kfp-down kfp-submit
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -55,13 +55,13 @@ failure-simulator-wedge:   # pauses the Kafka broker; simulator probes must go 5
 GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null)
 
 train:               # one reproducible training run -> MLflow run + registered version aliased `candidate`
-	GIT_SHA=$(GIT_SHA) $(COMPOSE) --profile train run --rm --build train train
+	GIT_SHA=$(GIT_SHA) $(COMPOSE) --profile train run --rm --build train amel-train train
 
 promote:             # explicit, audited candidate -> champion (fails with exit 2 if criteria fail)
-	$(COMPOSE) --profile train run --rm train promote --decided-by "$(or $(DECIDED_BY),$(USER))" $(PROMOTE_ARGS)
+	$(COMPOSE) --profile train run --rm train amel-train promote --decided-by "$(or $(DECIDED_BY),$(USER))" $(PROMOTE_ARGS)
 
 model-show:          # current candidate/champion from the registry
-	$(COMPOSE) --profile train run --rm train show
+	$(COMPOSE) --profile train run --rm train amel-train show
 
 # --- Observability (Milestone 6) ---
 
@@ -82,3 +82,23 @@ k8s-status:
 
 k8s-validate:        # schema-validate every manifest (also runs in CI)
 	kubeconform -strict -summary -ignore-missing-schemas infra/k8s/base infra/k8s/jobs infra/k8s/secret.example.yaml
+
+# --- Kubeflow Pipelines v2 (Milestone 9) ---
+
+pipeline-compile:    # PipelineSpec IR -> ml/pipelines/compiled/higgs_training_pipeline.yaml
+	uv run amel-pipeline compile
+
+pipeline-run-steps:  # the six steps in-process inside the training container (no Kubeflow) — reference path
+	$(COMPOSE) --profile train run --rm --build train amel-pipeline run-steps --max-rows $(or $(TRAINING_MAX_ROWS),100000) $(if $(TRAINING_AS_OF),--as-of $(TRAINING_AS_OF),)
+
+pipeline-run-docker: # compiled components, one container per task, via kfp.local DockerRunner
+	uv run amel-pipeline run-docker --max-rows $(or $(TRAINING_MAX_ROWS),100000) $(if $(TRAINING_AS_OF),--as-of $(TRAINING_AS_OF),) --git-sha $(GIT_SHA)
+
+kfp-up:              # KFP 2.17 standalone on the kind cluster (raises node cap to 6g, stops airflow/grafana/loki/tempo)
+	./scripts/kfp_up.sh
+
+kfp-down:
+	./scripts/kfp_down.sh
+
+kfp-submit:          # submit to the in-cluster API server (needs: kubectl -n kubeflow port-forward svc/ml-pipeline-ui 8888:80)
+	uv run amel-pipeline submit --host $(or $(KFP_HOST),http://localhost:8888) --max-rows $(or $(TRAINING_MAX_ROWS),100000) $(if $(TRAINING_AS_OF),--as-of $(TRAINING_AS_OF),) --git-sha $(GIT_SHA)

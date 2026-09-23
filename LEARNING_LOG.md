@@ -1178,3 +1178,121 @@ sampling (was OOM-looping at 512 MB with 100% Kafka spans).
   and what did you change?"
 - "How do you run part of a system in Kubernetes and the rest outside
   it during a migration?"
+
+## Milestone 9 — Kubeflow Pipelines v2
+
+**WHAT WAS BUILT.** `amel_training.steps` (six file-to-file steps +
+`run_all`), `ml/pipelines` (`amel-pipelines`: six `@dsl.component`s on
+`amel-training:local`, the `higgs_training_pipeline` DAG, compiled IR at
+`ml/pipelines/compiled/higgs_training_pipeline.yaml`, and the
+`amel-pipeline compile | run-steps | run-docker | submit` CLI),
+`scripts/kfp_up.sh` / `kfp_down.sh` (KFP 2.17.2 standalone on the kind
+cluster under a memory plan), image changes (no fixed ENTRYPOINT,
+`:local` tag, kfp installed). ADR-0011.
+
+**WHY IT EXISTS.** `amel-train train` is one process on one machine. A
+pipeline makes each stage a separately scheduled, separately resourced,
+separately retryable unit with recorded inputs and outputs — the shape
+training takes once data is too big for one box, or once several teams
+share the steps. The kickoff's rule — "do not introduce Kubeflow until
+the same workflow works outside Kubeflow" — is why the steps exist as
+plain functions first.
+
+**HOW KFP TURNS COMPONENTS INTO KUBERNETES WORKLOADS.**
+1. *Author time.* `@dsl.component` wraps a Python function: KFP inspects
+   its signature (`Input[Dataset]`, `Output[Model]`, ints, strings) and
+   generates a *component spec* — the image, a command that runs the
+   function through `kfp.dsl.executor_main`, and the typed inputs/
+   outputs. `@dsl.pipeline` records how tasks pass outputs to inputs;
+   that is the DAG.
+2. *Compile.* `Compiler().compile()` emits the **PipelineSpec IR**
+   (YAML): `components` (interfaces), `deploymentSpec.executors` (one
+   per component: image + command + resource limits), and
+   `root.dag.tasks` (edges via `dependentTasks` and artifact/parameter
+   references). With `kfp-kubernetes` a second document, the
+   **PlatformSpec**, carries Kubernetes-only config (here: `secretAsEnv`
+   for `DATABASE_URL`). The IR is backend-neutral — the same file runs
+   on the Docker runner and on a cluster.
+3. *Submit.* The KFP API server stores the IR and creates an **Argo
+   Workflow** from it. For every task the workflow controller runs a
+   small **driver** pod (`kfp-driver`) that resolves inputs from ML
+   Metadata, decides caching, and writes the concrete execution spec;
+   then the **executor** pod: an init container (`kfp-launcher`) injects
+   the launcher binary, and the `main` container is our image with the
+   launcher as PID 1. The launcher downloads input artifacts from the
+   pipeline's object store (SeaweedFS in this install) to local paths,
+   materializes parameters as JSON, runs `python -m
+   kfp.dsl.executor_main …` (which calls our function), uploads the
+   `Output[...]` artifacts and the `executor_output.json`, and records
+   the execution and artifacts in ML Metadata. Pod-level settings
+   (limits, env from Secrets) come from the executor spec + PlatformSpec.
+4. *Result.* Each task is an ordinary Pod with Kubernetes semantics —
+   scheduled, resource-limited, retriable, logged — and the lineage
+   (which artifact fed which task) lives in Metadata; MLflow gets the
+   ML-side record because our last step writes it explicitly.
+
+**WHAT WAS PROVEN.**
+- Same config, three runners, identical results: `amel-train train`
+  (v6), `run-steps` (v7) and `run-docker` (v8) all produced fingerprint
+  `81f8a8fd191441aa`, test accuracy 0.6825195378, ROC-AUC 0.7528702331,
+  11 artifacts each. `run-docker`: six containers, 1m36s.
+- `run-docker` v9 carries `orchestrator=kfp`, `kfp_run_id`, run name
+  `kfp-<id>` — the placeholder only substitutes when passed as a
+  component *input*.
+- Cluster: KFP 2.17.2 standalone (14 pods) installed under the memory
+  plan (node cap 3→6 GB; Airflow/Grafana/Loki/Tempo stopped): node real
+  usage 2.8 GB, host went from 8.4 GB used to 7.7 GB (the stopped
+  Compose services outweighed KFP). Submission via port-forward; task
+  pods = driver + `kfp-launcher` init + our image; see the Milestone
+  report for the run outcome and version.
+
+**IMPORTANT CODE FILES.**
+- `ml/training/src/amel_training/steps.py` — the six steps; `run_all`.
+- `ml/pipelines/src/amel_pipelines/pipeline.py` — components, DAG,
+  resource limits, the Secret mapping; note the deliberate absence of
+  `from __future__ import annotations`.
+- `ml/pipelines/src/amel_pipelines/cli.py` — the runners; how
+  `run-docker` reproduces what Compose/Kubernetes inject.
+- `ml/pipelines/compiled/higgs_training_pipeline.yaml` — read
+  `deploymentSpec.executors` and `root.dag.tasks`.
+- `scripts/kfp_up.sh` — the memory plan in code.
+- `infra/training/Dockerfile` — why no ENTRYPOINT, why `:local`.
+
+**FAILURE MODES / SURPRISES (exercised).**
+- `from __future__ import annotations` breaks `@dsl.component`
+  (string annotations).
+- A fixed image ENTRYPOINT swallows the executor command.
+- `:latest` → `imagePullPolicy: Always` → `ImagePullBackOff` for a
+  local-only image.
+- The local Docker runner needs the Compose network, a user-owned
+  pipeline root (a stale root-owned dir from a failed run blocked uid
+  1000), and the same env Compose injects.
+- Task pods need the Secret in *their* namespace (`kubeflow`), mapped
+  via `kfp-kubernetes`; the IR becomes two YAML documents.
+- KFP 2.17 ships SeaweedFS, not MinIO, as its artifact store.
+
+**HOW TO TEST IT.**
+- Unit: `make test` (steps on synthetic data, compile test).
+- `amel-pipeline compile`; `run-steps` vs `make train` on the same
+  `TRAINING_AS_OF`; `run-docker` (needs Docker + the Compose stack);
+  `scripts/kfp_up.sh` → `kubectl -n kubeflow port-forward
+  svc/ml-pipeline-ui 8888:80` → `amel-pipeline submit --host
+  http://localhost:8888` → MLflow shows a `kfp-<run id>` run; `scripts/
+  kfp_down.sh`.
+
+**CONCEPTS THE DEVELOPER SHOULD UNDERSTAND.**
+- Component spec vs pipeline spec vs platform spec; why the IR is
+  backend-neutral.
+- Driver/launcher/executor split and what ML Metadata records.
+- Artifacts vs parameters; why steps read/write files.
+- Image pull policy semantics of `:latest`.
+- Where secrets enter a pipeline pod (never the pipeline definition).
+
+**INTERVIEW QUESTIONS THIS SHOULD LET YOU ANSWER.**
+- "Walk me from a Python function to a running Pod in Kubeflow
+  Pipelines."
+- "How do you keep a pipeline and a plain training script from
+  drifting apart?" (shared step functions; equality test on outputs)
+- "Your pipeline pod is in ImagePullBackOff for an image you built
+  locally — why?"
+- "Where would a database credential come from inside a KFP task?"

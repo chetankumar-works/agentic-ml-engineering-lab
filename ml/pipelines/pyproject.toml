@@ -1,0 +1,23 @@
+[project]
+name = "amel-pipelines"
+version = "0.1.0"
+description = "Kubeflow Pipelines v2 definition of the HIGGS training workflow (containerized components over amel-training)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "amel-training",
+    "kfp>=2.17",
+    "kfp-kubernetes>=1.4",
+]
+
+[tool.uv.sources]
+amel-training = { workspace = true }
+
+[project.scripts]
+amel-pipeline = "amel_pipelines.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/amel_pipelines"]

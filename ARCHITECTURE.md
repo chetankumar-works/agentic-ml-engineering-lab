@@ -107,7 +107,7 @@ to record.
 
 ## Diagrams (Mermaid — GitHub renders these; update them as the system grows)
 
-Three views, all of what is **built** as of Milestone 8 unless a node is
+Three views, all of what is **built** as of Milestone 9 unless a node is
 marked *(planned)*. `PROJECT_STATE.md` is authoritative for status.
 
 ### System context
@@ -169,7 +169,9 @@ flowchart TB
         train -->|"params, metrics, artifacts,<br/>dataset fingerprint, git SHA"| mlflow["MLflow server"]
         mlflow --> mlflowdb[("Postgres db 'mlflow'")]
         mlflow -->|"artifacts, model"| minio
+        kfp["Kubeflow Pipelines (M9)<br/>6 containerized components<br/>same steps, same image"] -->|"register_model"| mlflow
         train -->|"register -> alias candidate"| registry_m["Registry: higgs_decision_tree<br/>@candidate / @champion"]
+        kfp -->|"alias candidate"| registry_m
         promote["amel-train promote<br/>criteria + audit"] -->|"alias champion"| registry_m
         promote -->|"ml.model_promotions"| curated
     end
@@ -258,11 +260,16 @@ flowchart LR
         m8b["startup/liveness/readiness<br/>+ stall watchdog"]
         m8c["make k8s-up/down · kubeconform in CI"]
     end
-    subgraph next ["M9+ (planned)"]
+    subgraph M9 ["M9 — Kubeflow Pipelines v2"]
+        m9a["amel_training.steps<br/>6 file-to-file steps"]
+        m9b["ml/pipelines: components + DAG<br/>compiled IR (PipelineSpec + PlatformSpec)"]
+        m9c["runners: run-steps · run-docker<br/>· submit (KFP on kind)"]
+    end
+    subgraph next ["M10+ (planned)"]
         m5["platform_api"]
         m8["Kubernetes"]
     end
-    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> next
+    M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> next
 ```
 
 
@@ -391,6 +398,14 @@ Kubernetes (kind, DECISIONS.md ADR-0010) — `make k8s-up`:
   probes         startup + liveness (/health incl. stall watchdog) + readiness (/ready); maxUnavailable 0
   ingress        ingress-nginx → http://amel.localtest.me/ → inference-api
   airflow        FEAST_SERVER_URL=http://amel-control-plane:30566 while the cluster runs
+
+Kubeflow Pipelines v2 (ml/pipelines, DECISIONS.md ADR-0011):
+  steps          amel_training.steps: load → validate → split → train → evaluate → register (files between)
+  components     @dsl.component × 6 on amel-training:local (install_kfp_package=False) → PipelineSpec IR YAML
+  run-steps      in-process reference; run-docker: kfp.local DockerRunner (one container per task)
+  submit         KFP 2.17.2 standalone on kind (scripts/kfp_up.sh: node cap 6g, Airflow/Grafana/Loki/Tempo stopped)
+                 task pod = driver + kfp-launcher init + our image; DATABASE_URL via Secret (kfp-kubernetes)
+  result         MLflow run kfp-<run id>, params orchestrator=kfp, registered version aliased candidate
 ```
 
 Implemented in `libs/amel_common` (shared schemas/logging), `libs/amel_db`
@@ -456,6 +471,10 @@ during each acceptance run, and what was actually verified:
   honest endpoints plus a progress watchdog; a bad config never
   receives traffic (readiness-gated rollout, proven), a hung loop is
   restarted (proven), configuration is injected via ConfigMap/Secret.
+- **One training workflow, three runners** (Milestone 9): the same step
+  functions produce identical fingerprints and metrics in-process, as
+  local containers and as KFP task pods — the pipeline cannot drift
+  from the script because it *is* the script.
 - Pinning the Python interpreter (`DECISIONS.md` ADR-0001) so dependency
   installs are reproducible across sessions and machines.
 

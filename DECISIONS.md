@@ -679,3 +679,78 @@ metrics-server and more ingestor replicas — re-measure the 3 GB cap
 then. If Compose/k8s config drift bites, generate both from one source.
 Move the stateful services in only when a multi-node or managed cluster
 exists.
+
+## ADR-0011: Kubeflow Pipelines v2 — the training workflow as six file-to-file steps, one image, three runners
+
+**Problem.** Milestone 9 needed training to execute as containerized
+KFP components that record results in MLflow — on a host where a KFP
+control plane costs ~2 GB and the kind node was capped at 3 GB — and
+the kickoff rule "do not introduce Kubeflow until the same workflow
+works outside Kubeflow" had to stay true.
+
+**Decision.**
+1. **`amel_training.steps`**: the Milestone 4 workflow cut into six
+   functions that read and write files (Parquet, skops, JSON):
+   `load_training_dataset` → `validate_training_dataset` →
+   `split_dataset` → `train_model` → `evaluate_model` →
+   `register_model`. They call the exact functions `train.py` calls;
+   `run_all()` runs them in-process.
+2. **`amel_pipelines.pipeline`**: one `@dsl.component` per step, all
+   with `base_image=amel-training:local` and `install_kfp_package=False`
+   (the image carries kfp), wired into `higgs_training_pipeline` with
+   parameters for everything `TrainingConfig` exposes; compiled to IR
+   YAML (`ml/pipelines/compiled/…`, 6 executors, checked by a test).
+3. **One image serves four roles**: `amel-train` (M4), `amel-pipeline
+   run-steps`, the KFP executor inside each task pod, and `run-docker`'s
+   task containers. It has **no fixed ENTRYPOINT** any more (KFP's
+   executor supplies the command), is tagged `:local` (Kubernetes pulls
+   `:latest` with policy `Always`, which cannot work for an image that
+   exists only inside the kind node), and installs `amel-pipelines`.
+4. **Three runners, same code**: `run-steps` (in-process reference),
+   `run-docker` (`kfp.local.DockerRunner` on the Compose network, run as
+   the invoking uid, one container per task, artifacts under
+   `~/.cache/amel-kfp-local`), and `submit` (a KFP API server on the kind
+   cluster: `scripts/kfp_up.sh` installs KFP 2.17.2 standalone, raises
+   the node cap to 6 GB and stops Compose's Airflow + Grafana/Loki/Tempo
+   for the duration; `kfp_down.sh` reverses it).
+5. `register_model` writes the same MLflow run shape as `train.py`
+   (params, tags, metrics, artifacts, signature, registered version
+   aliased `candidate`) plus `orchestrator` and `kfp_run_id`, so
+   `promote` (M4) and serving (M5) work unchanged on pipeline-trained
+   models.
+
+**Reason.**
+1–2. Components that are thin wrappers around tested functions keep
+   the "works outside Kubeflow" invariant checkable: `train.py`,
+   `run-steps` and `run-docker` on the same `as_of` produced the same
+   fingerprint `81f8a8fd191441aa` and identical metrics (test accuracy
+   0.6825195378, ROC-AUC 0.7528702331) as versions 6, 7 and 8.
+3. Two real failures drove the image changes: the executor's
+   `sh -c … kfp.dsl.executor_main` was swallowed by `ENTRYPOINT
+   ["amel-train"]` ("invalid choice: 'sh'"), and the cluster pod sat in
+   `ImagePullBackOff` trying to pull `amel-training:latest` from Docker
+   Hub.
+4. The Docker runner is the honest dev/CI path: containerized
+   components, no cluster, 1m36s end to end. The cluster path proves
+   the Kubernetes mechanics (driver pods, launcher, artifact store) —
+   see "how KFP turns components into workloads" in LEARNING_LOG.md —
+   and is expensive enough (control plane ~2 GB anon, 14 pods, ~10 min
+   install) that it is opt-in via `scripts/kfp_up.sh`, not part of
+   `make k8s-up`.
+5. Whether a model came from a laptop, a container or a cluster must
+   not change how it is promoted or served.
+
+**Tradeoffs.** KFP 2.17's platform-agnostic manifests bring their own
+MySQL and SeaweedFS object store (a second metadata DB and a second
+object store next to Postgres/MinIO — accepted for isolation; a
+production install would point KFP at managed services). Task pods in
+the `kubeflow` namespace need the `amel-secrets` Secret duplicated
+there. The `:local` tag must be overridden with a registry image
+(`AMEL_TRAINING_IMAGE`) anywhere but this machine. `run-docker` mounts
+the pipeline root from the host and needs the Compose network.
+
+**Future reconsideration trigger.** If the six steps drift from
+`train.py`, make `train.py` call `run_all` (one path). Replace the
+in-cluster MySQL/SeaweedFS with Postgres/MinIO if KFP becomes the only
+orchestrator. Add caching (`enable_caching`) once dataset fingerprints
+are stable across runs.

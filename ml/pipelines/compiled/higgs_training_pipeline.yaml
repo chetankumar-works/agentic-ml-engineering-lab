@@ -1,0 +1,614 @@
+# PIPELINE DEFINITION
+# Name: higgs-training
+# Description: AMEL HIGGS DecisionTree training as containerized KFP components
+# Inputs:
+#    as_of: str [Default: '']
+#    candidate_alias: str [Default: 'candidate']
+#    criterion: str [Default: 'gini']
+#    experiment_name: str [Default: 'higgs_decision_tree']
+#    feature_repo_path: str [Default: '/app/ml/feature_repo']
+#    git_sha: str [Default: '']
+#    max_depth: int [Default: 8.0]
+#    max_rows: int [Default: 100000.0]
+#    min_rows: int [Default: 1000.0]
+#    min_samples_leaf: int [Default: 200.0]
+#    registered_model_name: str [Default: 'higgs_decision_tree']
+#    seed: int [Default: 42.0]
+#    test_fraction: float [Default: 0.15]
+#    tracking_uri: str [Default: 'http://mlflow:5000']
+#    validation_fraction: float [Default: 0.15]
+components:
+  comp-evaluate-model:
+    executorLabel: exec-evaluate-model
+    inputDefinitions:
+      artifacts:
+        model:
+          artifactType:
+            schemaTitle: system.Model
+            schemaVersion: 0.0.1
+        splits:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+    outputDefinitions:
+      artifacts:
+        evaluation:
+          artifactType:
+            schemaTitle: system.Metrics
+            schemaVersion: 0.0.1
+      parameters:
+        Output:
+          parameterType: NUMBER_DOUBLE
+  comp-load-training-dataset:
+    executorLabel: exec-load-training-dataset
+    inputDefinitions:
+      parameters:
+        as_of:
+          parameterType: STRING
+        feature_repo_path:
+          parameterType: STRING
+        max_rows:
+          parameterType: NUMBER_INTEGER
+    outputDefinitions:
+      artifacts:
+        dataset:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        dataset_version:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        Output:
+          parameterType: STRING
+  comp-register-model:
+    executorLabel: exec-register-model
+    inputDefinitions:
+      artifacts:
+        dataset_version:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+        evaluation:
+          artifactType:
+            schemaTitle: system.Metrics
+            schemaVersion: 0.0.1
+        model:
+          artifactType:
+            schemaTitle: system.Model
+            schemaVersion: 0.0.1
+        splits:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        candidate_alias:
+          parameterType: STRING
+        criterion:
+          parameterType: STRING
+        experiment_name:
+          parameterType: STRING
+        git_sha:
+          parameterType: STRING
+        max_depth:
+          parameterType: NUMBER_INTEGER
+        min_samples_leaf:
+          parameterType: NUMBER_INTEGER
+        pipeline_run_id:
+          parameterType: STRING
+        registered_model_name:
+          parameterType: STRING
+        seed:
+          parameterType: NUMBER_INTEGER
+        tracking_uri:
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        Output:
+          parameterType: STRING
+  comp-split-dataset:
+    executorLabel: exec-split-dataset
+    inputDefinitions:
+      artifacts:
+        dataset:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        seed:
+          parameterType: NUMBER_INTEGER
+        test_fraction:
+          parameterType: NUMBER_DOUBLE
+        validation_fraction:
+          parameterType: NUMBER_DOUBLE
+    outputDefinitions:
+      artifacts:
+        splits:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        Output:
+          parameterType: NUMBER_INTEGER
+  comp-train-model:
+    executorLabel: exec-train-model
+    inputDefinitions:
+      artifacts:
+        splits:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        criterion:
+          parameterType: STRING
+        max_depth:
+          parameterType: NUMBER_INTEGER
+        min_samples_leaf:
+          parameterType: NUMBER_INTEGER
+        seed:
+          parameterType: NUMBER_INTEGER
+    outputDefinitions:
+      artifacts:
+        model:
+          artifactType:
+            schemaTitle: system.Model
+            schemaVersion: 0.0.1
+      parameters:
+        Output:
+          parameterType: NUMBER_DOUBLE
+  comp-validate-training-dataset:
+    executorLabel: exec-validate-training-dataset
+    inputDefinitions:
+      artifacts:
+        dataset:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        min_rows:
+          parameterType: NUMBER_INTEGER
+    outputDefinitions:
+      artifacts:
+        report:
+          artifactType:
+            schemaTitle: system.Dataset
+            schemaVersion: 0.0.1
+      parameters:
+        Output:
+          parameterType: BOOLEAN
+deploymentSpec:
+  executors:
+    exec-evaluate-model:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - evaluate_model
+        command:
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef evaluate_model(\n    model: Input[Model], splits: Input[Dataset],\
+          \ evaluation: Output[Metrics]\n) -> float:\n    from pathlib import Path\n\
+          \n    from amel_training.steps import evaluate_model as step\n\n    metrics\
+          \ = step(Path(model.path) / \"model.skops\", Path(splits.path), Path(evaluation.path))\n\
+          \    for k, v in metrics.items():\n        evaluation.log_metric(k, float(v))\n\
+          \    return float(metrics[\"test_accuracy\"])\n\n"
+        image: amel-training:local
+        resources:
+          cpuLimit: 1.0
+          memoryLimit: 2.0
+          resourceCpuLimit: '1'
+          resourceMemoryLimit: 2G
+    exec-load-training-dataset:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - load_training_dataset
+        command:
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef load_training_dataset(\n    dataset: Output[Dataset],\n    dataset_version:\
+          \ Output[Dataset],\n    max_rows: int,\n    as_of: str,\n    feature_repo_path:\
+          \ str,\n) -> str:\n    from pathlib import Path\n\n    from amel_training.steps\
+          \ import load_training_dataset as step\n\n    info = step(\n        Path(dataset.path),\n\
+          \        Path(dataset_version.path),\n        max_rows=max_rows,\n     \
+          \   as_of=as_of or None,\n        feature_repo_path=feature_repo_path,\n\
+          \    )\n    dataset.metadata.update({\"rows\": info[\"n_rows\"], \"fingerprint\"\
+          : info[\"fingerprint\"]})\n    return str(info[\"fingerprint\"])\n\n"
+        image: amel-training:local
+        resources:
+          cpuLimit: 1.0
+          memoryLimit: 2.0
+          resourceCpuLimit: '1'
+          resourceMemoryLimit: 2G
+    exec-register-model:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - register_model
+        command:
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef register_model(\n    model: Input[Model],\n    evaluation: Input[Metrics],\n\
+          \    dataset_version: Input[Dataset],\n    splits: Input[Dataset],\n   \
+          \ tracking_uri: str,\n    experiment_name: str,\n    registered_model_name:\
+          \ str,\n    candidate_alias: str,\n    git_sha: str,\n    criterion: str,\n\
+          \    max_depth: int,\n    min_samples_leaf: int,\n    seed: int,\n    pipeline_run_id:\
+          \ str,\n) -> str:\n    from pathlib import Path\n\n    from amel_training.steps\
+          \ import register_model as step\n\n    result = step(\n        Path(model.path)\
+          \ / \"model.skops\",\n        Path(evaluation.path),\n        Path(dataset_version.path),\n\
+          \        Path(splits.path),\n        tracking_uri=tracking_uri,\n      \
+          \  experiment_name=experiment_name,\n        registered_model_name=registered_model_name,\n\
+          \        candidate_alias=candidate_alias,\n        git_sha=git_sha or None,\n\
+          \        tree_params={\n            \"criterion\": criterion,\n        \
+          \    \"max_depth\": max_depth,\n            \"min_samples_leaf\": min_samples_leaf,\n\
+          \            \"random_state\": seed,\n        },\n        pipeline_run_id=pipeline_run_id\
+          \ or None,\n    )\n    return str(result[\"model_version\"])\n\n"
+        image: amel-training:local
+    exec-split-dataset:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - split_dataset
+        command:
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef split_dataset(\n    dataset: Input[Dataset],\n    splits: Output[Dataset],\n\
+          \    seed: int,\n    validation_fraction: float,\n    test_fraction: float,\n\
+          ) -> int:\n    from pathlib import Path\n\n    from amel_training.steps\
+          \ import split_dataset as step\n\n    sizes = step(\n        Path(dataset.path),\n\
+          \        Path(splits.path),\n        seed=seed,\n        validation_fraction=validation_fraction,\n\
+          \        test_fraction=test_fraction,\n    )\n    splits.metadata.update(sizes)\n\
+          \    return int(sizes[\"train\"])\n\n"
+        image: amel-training:local
+        resources:
+          cpuLimit: 1.0
+          memoryLimit: 2.0
+          resourceCpuLimit: '1'
+          resourceMemoryLimit: 2G
+    exec-train-model:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - train_model
+        command:
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef train_model(\n    splits: Input[Dataset],\n    model: Output[Model],\n\
+          \    criterion: str,\n    max_depth: int,\n    min_samples_leaf: int,\n\
+          \    seed: int,\n) -> float:\n    from pathlib import Path\n\n    from amel_training.steps\
+          \ import train_model as step\n\n    info = step(\n        Path(splits.path)\
+          \ / \"train.parquet\",\n        Path(model.path) / \"model.skops\",\n  \
+          \      tree_params={\n            \"criterion\": criterion,\n          \
+          \  \"max_depth\": max_depth,\n            \"min_samples_leaf\": min_samples_leaf,\n\
+          \            \"random_state\": seed,\n        },\n    )\n    model.metadata.update({\"\
+          tree_depth\": info[\"tree_depth\"], \"n_leaves\": info[\"n_leaves\"]})\n\
+          \    return float(info[\"fit_seconds\"])\n\n"
+        image: amel-training:local
+        resources:
+          cpuLimit: 1.0
+          memoryLimit: 2.0
+          resourceCpuLimit: '1'
+          resourceMemoryLimit: 2G
+    exec-validate-training-dataset:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - validate_training_dataset
+        command:
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef validate_training_dataset(\n    dataset: Input[Dataset], report:\
+          \ Output[Dataset], min_rows: int\n) -> bool:\n    from pathlib import Path\n\
+          \n    from amel_training.steps import validate_training_dataset as step\n\
+          \n    result = step(Path(dataset.path), Path(report.path), min_rows=min_rows)\n\
+          \    return bool(result[\"valid\"])\n\n"
+        image: amel-training:local
+        resources:
+          cpuLimit: 1.0
+          memoryLimit: 2.0
+          resourceCpuLimit: '1'
+          resourceMemoryLimit: 2G
+pipelineInfo:
+  description: AMEL HIGGS DecisionTree training as containerized KFP components
+  name: higgs-training
+root:
+  dag:
+    tasks:
+      evaluate-model:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-evaluate-model
+        dependentTasks:
+        - split-dataset
+        - train-model
+        inputs:
+          artifacts:
+            model:
+              taskOutputArtifact:
+                outputArtifactKey: model
+                producerTask: train-model
+            splits:
+              taskOutputArtifact:
+                outputArtifactKey: splits
+                producerTask: split-dataset
+        taskInfo:
+          name: evaluate-model
+      load-training-dataset:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-load-training-dataset
+        inputs:
+          parameters:
+            as_of:
+              componentInputParameter: as_of
+            feature_repo_path:
+              componentInputParameter: feature_repo_path
+            max_rows:
+              componentInputParameter: max_rows
+        taskInfo:
+          name: load-training-dataset
+      register-model:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-register-model
+        dependentTasks:
+        - evaluate-model
+        - load-training-dataset
+        - split-dataset
+        - train-model
+        inputs:
+          artifacts:
+            dataset_version:
+              taskOutputArtifact:
+                outputArtifactKey: dataset_version
+                producerTask: load-training-dataset
+            evaluation:
+              taskOutputArtifact:
+                outputArtifactKey: evaluation
+                producerTask: evaluate-model
+            model:
+              taskOutputArtifact:
+                outputArtifactKey: model
+                producerTask: train-model
+            splits:
+              taskOutputArtifact:
+                outputArtifactKey: splits
+                producerTask: split-dataset
+          parameters:
+            candidate_alias:
+              componentInputParameter: candidate_alias
+            criterion:
+              componentInputParameter: criterion
+            experiment_name:
+              componentInputParameter: experiment_name
+            git_sha:
+              componentInputParameter: git_sha
+            max_depth:
+              componentInputParameter: max_depth
+            min_samples_leaf:
+              componentInputParameter: min_samples_leaf
+            pipeline_run_id:
+              runtimeValue:
+                constant: '{{$.pipeline_job_uuid}}'
+            registered_model_name:
+              componentInputParameter: registered_model_name
+            seed:
+              componentInputParameter: seed
+            tracking_uri:
+              componentInputParameter: tracking_uri
+        taskInfo:
+          name: register-model
+      split-dataset:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-split-dataset
+        dependentTasks:
+        - load-training-dataset
+        - validate-training-dataset
+        inputs:
+          artifacts:
+            dataset:
+              taskOutputArtifact:
+                outputArtifactKey: dataset
+                producerTask: load-training-dataset
+          parameters:
+            seed:
+              componentInputParameter: seed
+            test_fraction:
+              componentInputParameter: test_fraction
+            validation_fraction:
+              componentInputParameter: validation_fraction
+        taskInfo:
+          name: split-dataset
+      train-model:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-train-model
+        dependentTasks:
+        - split-dataset
+        inputs:
+          artifacts:
+            splits:
+              taskOutputArtifact:
+                outputArtifactKey: splits
+                producerTask: split-dataset
+          parameters:
+            criterion:
+              componentInputParameter: criterion
+            max_depth:
+              componentInputParameter: max_depth
+            min_samples_leaf:
+              componentInputParameter: min_samples_leaf
+            seed:
+              componentInputParameter: seed
+        taskInfo:
+          name: train-model
+      validate-training-dataset:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-validate-training-dataset
+        dependentTasks:
+        - load-training-dataset
+        inputs:
+          artifacts:
+            dataset:
+              taskOutputArtifact:
+                outputArtifactKey: dataset
+                producerTask: load-training-dataset
+          parameters:
+            min_rows:
+              componentInputParameter: min_rows
+        taskInfo:
+          name: validate-training-dataset
+  inputDefinitions:
+    parameters:
+      as_of:
+        defaultValue: ''
+        isOptional: true
+        parameterType: STRING
+      candidate_alias:
+        defaultValue: candidate
+        isOptional: true
+        parameterType: STRING
+      criterion:
+        defaultValue: gini
+        isOptional: true
+        parameterType: STRING
+      experiment_name:
+        defaultValue: higgs_decision_tree
+        isOptional: true
+        parameterType: STRING
+      feature_repo_path:
+        defaultValue: /app/ml/feature_repo
+        isOptional: true
+        parameterType: STRING
+      git_sha:
+        defaultValue: ''
+        isOptional: true
+        parameterType: STRING
+      max_depth:
+        defaultValue: 8.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      max_rows:
+        defaultValue: 100000.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      min_rows:
+        defaultValue: 1000.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      min_samples_leaf:
+        defaultValue: 200.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      registered_model_name:
+        defaultValue: higgs_decision_tree
+        isOptional: true
+        parameterType: STRING
+      seed:
+        defaultValue: 42.0
+        isOptional: true
+        parameterType: NUMBER_INTEGER
+      test_fraction:
+        defaultValue: 0.15
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
+      tracking_uri:
+        defaultValue: http://mlflow:5000
+        isOptional: true
+        parameterType: STRING
+      validation_fraction:
+        defaultValue: 0.15
+        isOptional: true
+        parameterType: NUMBER_DOUBLE
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.17.0
+---
+platforms:
+  kubernetes:
+    deploymentSpec:
+      executors:
+        exec-load-training-dataset:
+          secretAsEnv:
+          - keyToEnv:
+            - envVar: DATABASE_URL
+              secretKey: DATABASE_URL
+            optional: false
+            secretName: amel-secrets
+            secretNameParameter:
+              runtimeValue:
+                constant: amel-secrets
