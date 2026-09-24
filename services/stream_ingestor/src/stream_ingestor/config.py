@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     features_dlq_topic: str = "higgs.features.dlq"
     labels_dlq_topic: str = "higgs.labels.dlq"
     consumer_group: str = "stream-ingestor"
+    # librdkafka prefetch bounds, per consumer. Defaults are librdkafka's
+    # own (2.15.1): a 64 MiB pre-fetch queue plus up to 50 MiB per fetch
+    # response — under backlog that is ~115 MiB per replica on top of the
+    # steady ~86 MiB. The k8s Deployment lowers both (DECISIONS.md ADR-0012).
+    kafka_queued_max_messages_kbytes: int = 65536
+    kafka_fetch_max_bytes: int = 52428800
 
     batch_size: int = 500
     batch_timeout_seconds: float = 2.0
@@ -27,6 +33,16 @@ class Settings(BaseSettings):
     log_level: str = "info"
     http_port: int = 8002
     service_name: str = "stream_ingestor"
+
+    def consumer_config(self) -> dict[str, object]:
+        return {
+            "bootstrap.servers": self.kafka_bootstrap_servers,
+            "group.id": self.consumer_group,
+            "enable.auto.commit": False,
+            "auto.offset.reset": "earliest",
+            "queued.max.messages.kbytes": self.kafka_queued_max_messages_kbytes,
+            "fetch.max.bytes": self.kafka_fetch_max_bytes,
+        }
 
     def dlq_topic_for(self, topic: str) -> str:
         if topic == self.features_topic:

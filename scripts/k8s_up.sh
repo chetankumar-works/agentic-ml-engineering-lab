@@ -31,6 +31,9 @@ else
     || { echo "node is stopped: use make mode-k8s" >&2; exit 1; }
   ns=$(kubectl get namespace kubeflow --ignore-not-found -o name)
   [ -z "$ns" ] || { echo "KFP is installed: run make kfp-down first" >&2; exit 1; }
+  # Step 2 sets the 3g cap; under scale mode's workload that squeezes the node.
+  [ "$(docker inspect -f '{{.HostConfig.Memory}}' amel-control-plane)" = "$(numfmt --from=iec "${NODE_MEMORY^^}")" ] \
+    || { echo "node is not at the $NODE_MEMORY cap (another mode): use make mode-k8s" >&2; exit 1; }
 fi
 docker update --memory "$NODE_MEMORY" --memory-swap "$NODE_MEMORY" amel-control-plane >/dev/null
 echo "   node capped at $NODE_MEMORY"
@@ -39,6 +42,13 @@ echo "== 3. ingress-nginx ($INGRESS_NGINX_VERSION) + images"
 kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/${INGRESS_NGINX_VERSION}/deploy/static/provider/kind/deploy.yaml" >/dev/null
 # the Ingress below is validated by ingress-nginx's admission webhook — it must be up first
 kubectl -n ingress-nginx wait --for=condition=available deployment/ingress-nginx-controller --timeout=180s >/dev/null
+# ingress-nginx runs one worker per CPU by default: 32 here, 322 MiB anon.
+# Two workers bound it internally (37 MiB); the limit is a backstop with
+# room for its binaries' page cache (DECISIONS.md ADR-0012).
+kubectl -n ingress-nginx patch configmap ingress-nginx-controller --type merge \
+  -p '{"data":{"worker-processes":"2"}}' >/dev/null
+kubectl -n ingress-nginx set resources deployment/ingress-nginx-controller --limits=memory=256Mi >/dev/null
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s >/dev/null
 $COMPOSE build -q $MOVED migrate >/dev/null
 for img in amel-inference-api amel-feast-server amel-source-simulator amel-stream-ingestor amel-migrate; do
   kind load docker-image "$img:latest" --name amel >/dev/null 2>&1 && echo "   loaded $img"

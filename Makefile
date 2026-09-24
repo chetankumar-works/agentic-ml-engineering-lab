@@ -1,4 +1,4 @@
-.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing mode mode-compose mode-k8s mode-kfp k8s-up k8s-down k8s-status k8s-validate pipeline-compile pipeline-run-steps pipeline-run-docker kfp-up kfp-down kfp-submit
+.PHONY: install lint fmt typecheck test up down logs migrate seed smoke feast-materialize feast-demo failure-simulator-wedge train promote model-show smoke-tracing mode mode-compose mode-k8s mode-scale mode-kfp k8s-up k8s-down k8s-status k8s-validate pipeline-compile pipeline-run-steps pipeline-run-docker kfp-up kfp-down kfp-submit
 
 COMPOSE = docker compose -f infra/docker-compose.yml
 
@@ -78,6 +78,9 @@ mode-compose:        # stop the kind node, full Compose stack
 
 mode-k8s:            # node at 3g (KFP removed first if present), Compose minus the four moved services
 	./scripts/mode.sh k8s
+
+mode-scale:          # from k8s mode: node at 5.5g, Airflow stopped (M10 scaling experiments; ADR-0012)
+	./scripts/mode.sh scale
 
 mode-kfp:            # node at 6g, Compose trimmed to postgres/minio/mlflow, amel Deployments at 0
 	./scripts/mode.sh kfp

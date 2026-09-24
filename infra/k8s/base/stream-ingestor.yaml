@@ -22,6 +22,12 @@ spec:
             # one span per Kafka message at 100% OOM-looped Tempo; sample (ADR-0010)
             - { name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio }
             - { name: OTEL_TRACES_SAMPLER_ARG, value: "0.02" }
+            # bounded prefetch + pool so replicas scale linearly and cannot
+            # exhaust Postgres max_connections (DECISIONS.md ADR-0012)
+            - { name: KAFKA_QUEUED_MAX_MESSAGES_KBYTES, value: "16384" }
+            - { name: KAFKA_FETCH_MAX_BYTES, value: "8388608" }
+            - { name: DB_POOL_SIZE, value: "2" }
+            - { name: DB_MAX_OVERFLOW, value: "0" }
           envFrom:
             - configMapRef: { name: amel-config }
             - secretRef: { name: amel-secrets }

@@ -6,9 +6,10 @@
 #   mode      node                      Compose runs
 #   compose   stopped or absent         full stack
 #   k8s       running, cap 3g, no KFP   everything except the four moved services
+#   scale     running, cap 5.5g, no KFP k8s set minus airflow (M10 scaling experiments)
 #   kfp       running, cap 6g           postgres, minio, mlflow only
 #
-# Usage: scripts/mode.sh status | check MODE | compose | k8s | kfp
+# Usage: scripts/mode.sh status | check MODE | compose | k8s | scale | kfp
 #
 # A node that may still hold KFP is only ever started at the KFP cap with
 # Compose trimmed to the kfp set, so the worst case at every step is the
@@ -19,6 +20,7 @@ COMPOSE="docker compose -f infra/docker-compose.yml"
 NODE=amel-control-plane
 K8S_CAP="${KIND_NODE_MEMORY:-3g}"
 KFP_CAP="${KIND_NODE_MEMORY_KFP:-6g}"
+SCALE_CAP="${KIND_NODE_MEMORY_SCALE:-5632m}"   # 5.5 GiB; docker rejects fractional units
 MOVED="inference-api feast-server source-simulator stream-ingestor"
 KFP_KEEP="minio mlflow postgres"
 exec 3>&2   # the real stderr, for errors that must survive `check 2>/dev/null`
@@ -31,6 +33,7 @@ allowed() {
   case "$1" in
     compose) all_services ;;
     k8s) comm -23 <(all_services) <(echo "$MOVED" | words) ;;
+    scale) comm -23 <(all_services) <(echo "$MOVED airflow" | words) ;;
     kfp) echo "$KFP_KEEP" | words ;;
   esac
 }
@@ -52,7 +55,23 @@ wait_api() {
     sleep 3
   done
 }
-set_cap() { docker update --memory "$1" --memory-swap "$1" "$NODE" >/dev/null; echo "   node cap $1"; }
+node_anon() {
+  awk '$1=="anon"{print $2}' "/sys/fs/cgroup/docker/$(docker inspect -f '{{.Id}}' "$NODE")/memory.stat"
+}
+# Lowering a cap under a running workload is how the node livelocked
+# (MISTAKES.md, M9): refuse unless current anon is <= 75% of the new cap.
+set_cap() {
+  local new; new=$(bytes "$1")
+  if node_running && [ "$new" -lt "$(node_cap)" ]; then
+    local anon; anon=$(node_anon)
+    if [ $(( anon * 4 )) -gt $(( new * 3 )) ]; then
+      echo "node anon $(( anon >> 20 )) MiB exceeds 75% of the new cap $1; reduce the workload first" >&2
+      exit 1
+    fi
+  fi
+  docker update --memory "$1" --memory-swap "$1" "$NODE" >/dev/null; echo "   node cap $1"
+}
+cap_for() { case "$1" in k8s) echo "$K8S_CAP" ;; scale) echo "$SCALE_CAP" ;; kfp) echo "$KFP_CAP" ;; esac; }
 
 # Prints violations of MODE to stderr; exit status 0 only if none.
 check() {
@@ -65,10 +84,10 @@ check() {
     if ! node_running; then
       echo "   kind node is not running" >&2; bad=1
     else
-      local want; want=$(bytes "$([ "$mode" = kfp ] && echo "$KFP_CAP" || echo "$K8S_CAP")")
+      local want; want=$(bytes "$(cap_for "$mode")")
       [ "$(node_cap)" = "$want" ] || { echo "   node cap $(node_cap) bytes, $mode mode needs $want" >&2; bad=1; }
-      if [ "$mode" = k8s ] && kfp_installed; then
-        echo "   KFP is installed; k8s mode's cap would livelock the node" >&2; bad=1
+      if [ "$mode" != kfp ] && kfp_installed; then
+        echo "   KFP is installed; only kfp mode's cap holds it" >&2; bad=1
       fi
     fi
   fi
@@ -77,15 +96,15 @@ check() {
 
 status() {
   if ! cluster_exists; then echo "node: absent"
-  elif node_running; then echo "node: running, cap $(( $(node_cap) / 1073741824 ))g"
+  elif node_running; then echo "node: running, cap $(( $(node_cap) >> 20 ))m, anon $(( $(node_anon) >> 20 ))m"
   else echo "node: stopped"; fi
   echo "compose: $(running | tr '\n' ' ')"
   local m
-  for m in compose k8s kfp; do
+  for m in compose k8s scale kfp; do
     if check "$m" 2>/dev/null; then echo "mode: $m"; return 0; fi
   done
   echo "mode: NONE — the running set matches no mode:" >&2
-  for m in compose k8s kfp; do echo " $m:" >&2; check "$m" || true; done
+  for m in compose k8s scale kfp; do echo " $m:" >&2; check "$m" || true; done
   return 1
 }
 
@@ -142,7 +161,14 @@ to_k8s() {
     trim_compose k8s
     exec ./scripts/k8s_up.sh
   fi
-  if ! node_running || [ "$(node_cap)" != "$(bytes "$K8S_CAP")" ]; then
+  if node_running && [ "$(node_cap)" = "$(bytes "$SCALE_CAP")" ] && ! kfp_installed; then
+    echo "== leaving scale mode: manifests back to their replica counts, then the 3g cap"
+    kubectl apply -k infra/k8s/base >/dev/null
+    for d in feast-server inference-api source-simulator stream-ingestor; do
+      kubectl -n amel rollout status deployment/"$d" --timeout=300s >/dev/null
+    done
+    set_cap "$K8S_CAP"
+  elif ! node_running || [ "$(node_cap)" != "$(bytes "$K8S_CAP")" ]; then
     start_node_in_kfp_envelope
     if kfp_installed; then
       echo "== KFP still installed: removing it first"
@@ -160,13 +186,23 @@ to_k8s() {
   ./scripts/k8s_up.sh
 }
 
+# Scale mode is entered from k8s mode only: same cluster state, cap raised
+# (raising is always safe), Airflow stopped.
+to_scale() {
+  check k8s 2>/dev/null || { echo "enter scale mode from k8s mode: make mode-k8s first" >&2; check k8s || true; exit 1; }
+  set_cap "$SCALE_CAP"
+  echo "== stopping what scale mode excludes"
+  trim_compose scale
+}
+
 case "${1:-status}" in
   status) status ;;
   check)
-    [ -n "${2:-}" ] || { echo "usage: $0 check compose|k8s|kfp" >&2; exit 2; }
+    [ -n "${2:-}" ] || { echo "usage: $0 check compose|k8s|scale|kfp" >&2; exit 2; }
     check "$2" || { echo "not in $2 mode (make mode-$2)" >&2; exit 1; } ;;
   compose) to_compose; status ;;
   k8s) to_k8s; status ;;
+  scale) to_scale; status ;;
   kfp) to_kfp; status ;;
-  *) echo "usage: $0 status|check MODE|compose|k8s|kfp" >&2; exit 2 ;;
+  *) echo "usage: $0 status|check MODE|compose|k8s|scale|kfp" >&2; exit 2 ;;
 esac

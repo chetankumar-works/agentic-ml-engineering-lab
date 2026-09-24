@@ -507,3 +507,29 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
   delete, and it fails the old order. Lesson: a stub has to model the
   real system's ownership, checked against `kubectl kustomize`, not
   against the script it tests.
+
+### Memory budgets counted anon and left out swap
+- **What happened**: ADR-0012's first budgets used cgroup `anon` (+
+  `shmem`) as "demand". With 7 GB free, the kernel (swappiness 60) had
+  swapped out 2.5 GB of idle anon: Redis 809 MiB, Airflow 783, MLflow
+  337, Kafka 156. Those services' real demand was larger than the
+  budget said, and a partly swapped Redis would have corrupted M10's
+  latency numbers without it showing in the results.
+- **Root cause**: RUNBOOKS said "swapped-out anon is still demand", but
+  the budget arithmetic didn't read `memory.swap.current`.
+- **Fix**: Redis is bounded (`maxmemory`) with swap disabled for its
+  container (`memswap_limit = mem_limit`, verified `swap.current 0`).
+  The ADR is corrected; Kafka and MLflow swap is an open decision
+  before M10's inference measurements.
+
+### Read the node's hierarchical `memory.events` as its own
+- **What happened**: 28 `max` events during the KFP run were explained
+  as page cache reclaimed at the node's cap, although `memory.peak`
+  (5.57 of 6 GiB) said the node never reached it. Later the node showed
+  7,340 events at 41% of its cap.
+- **Root cause**: cgroup v2 `memory.events` includes descendants. A pod
+  hitting its own limit (inference-api at 512Mi: 139 events) counts on
+  the node too. `memory.events.local` is the node's own count.
+- **Fix**: `scripts/mem_sample.sh` records `memory.events.local` and
+  `memory.peak` per target; the ADR's explanation is revised.
+

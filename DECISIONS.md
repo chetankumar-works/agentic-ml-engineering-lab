@@ -796,6 +796,7 @@ memory cap identifies the mode.
 |---|---|---|---|
 | `compose` | stopped or absent | full stack (16 long-running) | 7.96 GB used, 7.9 GB available |
 | `k8s` | running, cap 3 GiB, no KFP; the four stateless services | everything except the four moved services | 8.68 GB used, 7.16 GB available; node anon 1.61 GiB, PSI 0 |
+| `scale` (M10) | running, cap 5.5 GiB, no KFP | k8s set minus Airflow | node anon 1.5 GiB idle, 2.28 GiB at 8 ingestors under backlog; VM ≥ 8.4 GB available |
 | `kfp` | running, cap 6 GiB; M8 Deployments scaled to 0 | postgres, minio, mlflow | ≥ 10.1 GB available throughout a training run |
 
 1. `make mode` reports the mode, or every violation when the running set
@@ -929,57 +930,102 @@ construction: a workload with many concurrent heavy queries could
 exceed 0.7 GiB. MinIO has no internal bound (0.10 GiB under a training
 run).
 
-**Projected budget for M10 (HPA + KEDA). Not measured; to be approved
-before M10 starts.** M10 deliberately creates Kafka backlog and adds
-replicas to k8s mode, whose node already sits at 1.76 GiB anon of 3 GiB
-(59%). Additions to the node's anon, with sources:
+**M10 budget: `scale` mode (approved 2026-09-24, implemented, partly
+measured).**
 
-| item | per unit | units | added | source |
-|---|---|---|---|---|
-| stream-ingestor under backlog, librdkafka defaults | 86 MiB steady + ≤ 64 MiB prefetch queue + ≤ 50 MiB in-flight fetch ≈ 200 MiB | 6 (partitions per topic) | +1.11 GiB | steady: measured pod anon; queue/fetch: `queued.max.messages.kbytes`=65536 and `fetch.max.bytes`=52428800, the documented defaults of librdkafka 2.15.1 (pinned), per consumer |
-| same, client bounded (`queued.max.messages.kbytes`=16384, `fetch.max.bytes`=8 MiB) | ≈ 110 MiB | 6 | +0.56 GiB | same arithmetic |
-| inference-api via HPA | 218 MiB (idle, measured); limit 512Mi | 3 (proposed max) | +0.43 GiB expected; +1.3 GiB at limits | pod anon measured; per-replica anon *under load* unknown |
-| KEDA v2.21.0 (operator, metrics-apiserver, admission) | request 100Mi; upstream limit 1000Mi | 3 | +0.29 GiB expected | upstream release manifest; usage not measured. Upstream limits total 2.9 GiB, so they must be overridden (256Mi each → worst 0.75 GiB) |
-| metrics-server v0.9.0 | request 200Mi, no upstream limit | 1 | +0.2 GiB expected | upstream `components.yaml`; set a 256Mi limit |
+*Mode:* `make mode-scale` is entered from k8s mode only. It raises the
+node cap to **5.5 GiB** (`5632m`; docker rejects fractional units) and
+stops Airflow. Leaving it (`make mode-k8s`) re-applies the manifests'
+replica counts before lowering the cap.
 
-- **Node total:** 1.76 + 0.56 + 0.43 + 0.29 + 0.2 = **3.24 GiB** with the
-  client bounded, or **3.79 GiB** with defaults. **It does not fit the 3
-  GiB k8s cap either way.** It would sit at or above 100% of the cap, in
-  the regime where the node livelocked.
-- **Required cap under the 75% margin:** 3.24 / 0.75 → **4.5 GiB**
-  (bounded) or 5.5 GiB (defaults).
-- **Compose side (k8s set, measured now):** anon+shmem 4.73 GiB,
-  counting Redis at its `used_memory` 1.38 GiB and Airflow at 1.28 GiB.
-  Expected growth under backlog: Kafka toward its heap ceiling (+~0.5
-  GiB, JVM sizing, not measured) and Postgres toward its 0.7 GiB bound
-  (+0.5).
-- **Proposed `scale` mode:** k8s set minus Airflow (Airflow isn't needed
-  for a scaling experiment, which also stops Redis growth) and a node
-  cap of 4.5 GiB.
-  - Budget: 1.35 overhead + (4.73 − 1.28 + 0.5 + 0.5 = 4.45) Compose +
-    4.5 node = **10.3 GiB of 15.47, leaving 5.2 GiB of headroom**.
-  - Keeping Airflow: 11.6 GiB (3.9 headroom).
-  - Defaults and Airflow at a 5.5 GiB cap: 12.6 GiB (2.9 headroom). Not
-    proposed.
-- **Connections:** six ingestors plus three inference replicas on
-  SQLAlchemy's default pool (5 + 10 overflow each) could open 135
-  connections against `max_connections` 50. Measured: 1–2 per
-  ingestor. Bound the pools (pool_size 2, max_overflow 0) for the
-  scaled services rather than raising the multiplier.
-- **Before scaling out, M10 starts by measuring:**
-  1. One ingestor draining a deliberate backlog: pause for 6 min
-     (≈70k+ messages at the simulator's 100/s per topic with 10×
-     bursts), then drain, sampled at 250 ms.
-  2. KEDA and metrics-server actual anon after install.
-  3. inference-api anon under the HPA load.
+*Why 5.5 GiB and not 4.5:* 4.5 GiB fits only the bounded projection
+(3.24 GiB = 72%). The unbounded projection (3.79 GiB) would be 84% of
+4.5, above the one livelock data point (82%). The cap is sized for the
+case that can actually be hit (3.79 = 69% of 5.5). If bounding works,
+the difference is extra margin. Cost: about 1 GiB of headroom.
 
-  If any number exceeds its projection, the cap and the maximum replica
-  counts are re-derived before they are used.
+*Cap lowering is guarded:* `mode.sh` refuses to lower a node cap when
+current anon exceeds 75% of the new value. That check would have
+refused the original KFP incident (2.47 GiB against a 2.25 GiB
+threshold). `k8s_up.sh` refuses to run on a node that isn't at its 3g
+cap, because its step 2 would set 3g under another mode's workload.
+
+*Before any M10 measurement, Redis and ingress-nginx were bounded:*
+- **Redis:** `maxmemory 1gb`, `allkeys-lru`. The online store is a
+  rebuildable projection of curated Postgres, so eviction is acceptable,
+  and materialization writes keep recent entities hot.
+  - Applied live first: 985,114 keys evicted, 2.89M → 1.91M.
+  - Then a fresh snapshot (884 MB; the fork copied 312 MiB on write),
+    then the container was recreated.
+  - `mem_limit` = `memswap_limit` = 1792m disables swap **for this
+    container**. At swappiness 60 the kernel had swapped out 800 MiB of
+    idle keys with 7 GB free, so `maxmemory` alone cannot hold swap at
+    zero.
+  - Verified: `memory.swap.max 0`, `swap.current 0`, anon 1,021 MiB,
+    and the Redis-backed inference path is green (`make smoke-tracing`).
+  - Tightest moment is a restart: `memory.peak` 1,603 of 1,792 MiB,
+    snapshot page cache on top of the dataset; anon is 57% of the cap.
+- **ingress-nginx:** one worker per CPU by default, so 32 workers and
+  322 MiB anon. `worker-processes: 2` brings it to **37 MiB**, with a
+  256Mi limit as a backstop sized for its binaries' page cache. Both are
+  in `k8s_up.sh`.
+
+*Ingestor under backlog, projected vs measured.* Scale mode, 250 ms
+sampling plus the pod's `memory.peak`. Each backlog was a 10-minute
+pause, 113–121k messages (≈75 MB; messages average 1,114 B for
+features and 160 B for labels).
+
+| case | projected | measured | notes |
+|---|---|---|---|
+| 1 replica, librdkafka defaults | ≈ 200 MiB | **211 MiB** peak at +3.8 s, back to 96–107 | drain ≈ 33 s (≈ 3,800 msg/s) |
+| 1 replica, bounded (`queued.max.messages.kbytes` 16384, `fetch.max.bytes` 8 MiB) | ≈ 110 MiB | **136 MiB** sampled, `memory.peak` 144 | projection 24% low; drain time unchanged, so bounding costs no throughput |
+| 8 replicas (6 partitions per topic + 2), bounded | 6 × 110 + idle | 6 active: **114–150 MiB**; **2 idle: 79 MiB each** | the 2 extra consumers got **no partitions**; 113k drained ≈ 13 s including pod start |
+| node at 8 replicas | – | anon **2.28 GiB of 5.5 (41%)**, full PSI 0, VM ≥ 8.4 GB available | Postgres 16 connections with pools at 2 + 0 |
+
+Implications for M10: consumers beyond the partition count cost memory
+(79 MiB each) and do nothing. A single bounded ingestor drains about
+20× the simulator's steady rate, so lag-based KEDA scaling needs a
+sustained overload (a higher simulator rate) to trigger for more than
+a few seconds.
+
+*Still projected (not measured):*
+- KEDA: 3 × 100Mi requests; upstream limits 3 × 1000Mi, to be
+  overridden to 256Mi.
+- metrics-server: 200Mi request; give it a 256Mi limit.
+- inference-api under load. **Its pod has already hit its 512Mi limit
+  139 times** (`memory.peak` 512, anon 219 now; 40 ms of total stall),
+  most likely at startup, when model artifacts in page cache count
+  toward the limit. Every replica the HPA adds will go through that, so
+  measure startup and load peaks before choosing `maxReplicas` or
+  raising the limit.
+
+*The 28 `max` events from the kfp run, revisited:* cgroup v2
+`memory.events` is **hierarchical**. It counts descendants hitting
+their own limits: the 2G task pods, or inference-api's 512Mi. Separately,
+page cache that fills a cap is reclaimed at the limit and increments
+the node's own counter. `memory.events.local` today reads 7,173, all
+accumulated during about 20 h at the 3g k8s cap with the cgroup pinned
+at its limit by page cache and PSI at 0.00. The kfp run's
+`memory.peak` (5.57 of 6 GiB) says the node itself never reached its
+cap, so descendant limits are the better explanation for those 28. The
+250 ms re-run on the next KFP training run reads
+`memory.events.local` on the node and on each pod. `mem_sample.sh` now
+records both.
+
+*Correction to this ADR's budgets: swapped anon was left out.* Swap
+counts as demand. At swappiness 60, idle pages were swapped out with
+7 GB free: Redis 809 MiB, Airflow 783, MLflow 337, Grafana 214, Kafka
+156, Postgres 25. For MLflow and Kafka the anon-only figures above
+understate demand by those amounts. Redis is fixed; Airflow is
+excluded from scale mode. Kafka (on the latency path of inference's
+publish) and MLflow still swap: disable swap per container or accept it
+as a measured bias. Decide before M10's inference measurements.
 
 **Future reconsideration trigger.**
 - Re-measure if the training `max_rows` grows past 100k or the task pod
   limit changes. The node's anon must stay ≤ 75% of 6 GiB (4.5 GiB).
 - If full-stack Postgres connections approach 40, raise
   `max_connections` and recompute the bound.
-- M10 gets its `scale` mode row once the projection above is approved
-  and its first measurements replace the projected numbers.
+- Replace the remaining projected M10 rows (KEDA, metrics-server,
+  inference under load and at startup) with measurements before
+  `maxReplicas` is set above what has been measured.

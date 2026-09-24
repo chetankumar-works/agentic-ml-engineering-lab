@@ -28,10 +28,21 @@ def get_database_url() -> str:
     return url
 
 
+def pool_settings() -> dict[str, int]:
+    """SQLAlchemy's pool defaults (5 + 10 overflow) per process, unless
+    `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` are set. Replicated services set
+    them low so N replicas cannot exceed Postgres `max_connections`
+    (DECISIONS.md ADR-0012)."""
+    return {
+        "pool_size": int(os.environ.get("DB_POOL_SIZE", "5")),
+        "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", "10")),
+    }
+
+
 def get_engine() -> Engine:
     global _engine
     if _engine is None:
-        _engine = create_engine(get_database_url(), pool_pre_ping=True)
+        _engine = create_engine(get_database_url(), pool_pre_ping=True, **pool_settings())
         telemetry.instrument_sqlalchemy(_engine)  # no-op unless OTEL_ENABLED
     return _engine
 

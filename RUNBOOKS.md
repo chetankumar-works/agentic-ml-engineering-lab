@@ -514,8 +514,9 @@ group** for an hour.
 ## Compose/kind modes and the memory budget (ADR-0012)
 
 - Rule: the full Compose stack and the kind node never run together.
-  `make mode` shows the current mode (`compose`, `k8s`, `kfp`) or lists
-  every violation. Switch only with `make mode-compose|mode-k8s|mode-kfp`.
+  `make mode` shows the current mode (`compose`, `k8s`, `scale`, `kfp`)
+  or lists every violation. Switch only with `make mode-compose|mode-k8s|
+  mode-scale|mode-kfp` (`mode-scale` from k8s mode only).
 - After a Docker Desktop restart, containers come back as they were.
   Run `make mode` before anything else. `mode: NONE` means fix it with a
   mode target first.
@@ -573,3 +574,27 @@ all include page cache, and page cache is not demand.**
 - Swap counts: Redis showed 1.0 GiB resident but `used_memory` 1.38 GiB
   (425 MiB in `memory.swap.current`). For services with their own
   accounting (Redis `INFO memory`, JVM heap), take the larger number.
+- `memory.events` is **hierarchical**: a pod hitting its own limit
+  increments the node's counter too. For a cgroup's own limit hits read
+  `memory.events.local`. Page cache that fills a cap is reclaimed at the
+  limit and counts as `max` events with PSI 0; that alone is harmless.
+- Swap happens with free memory (swappiness 60 swaps idle anon out).
+  Check `memory.swap.current` per container before any latency
+  measurement. To keep a service out of swap, set `mem_limit` =
+  `memswap_limit` in Compose (`memory.swap.max` becomes 0), which Redis
+  does.
+
+## Redis online store is bounded (feature misses after eviction)
+
+- Redis runs with `maxmemory 1gb`, `allkeys-lru` and no swap
+  (DECISIONS.md ADR-0012). Old, rarely read entities get evicted; recent
+  ones stay hot because materialization writes them.
+- Symptom: `POST /predict/entity/<id>` returns 404 "no online features"
+  for an old entity. Check `redis-cli info stats | grep evicted_keys`.
+  This is expected: the online store is a projection. Rebuild a window
+  with `make feast-materialize` (chunked; never unbounded, see the M3
+  OOM in MISTAKES.md), or predict with raw features via `/predict`.
+- `used_memory` near `maxmemory` with `evicted_keys` climbing quickly
+  means the working set outgrew 1 GiB. Raise both `maxmemory` and the
+  container cap together and re-check ADR-0012's budget. Never remove
+  the bound.

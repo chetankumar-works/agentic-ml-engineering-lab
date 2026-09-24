@@ -99,6 +99,18 @@ services:
   redis:
     restart: unless-stopped
     image: redis:7-alpine
+    # The online store is a rebuildable projection of curated Postgres
+    # (`make feast-materialize`), so eviction is acceptable: maxmemory is
+    # the bound, least-recently-used entities go first (materialization
+    # writes keep recent ones hot). mem_limit == memswap_limit disables
+    # swap for this container only — at swappiness 60 the kernel swapped
+    # 800 MiB of idle keys out with 7 GB free, and a partly swapped
+    # Redis corrupts latency measurements. The cap is a backstop at ~1.75x
+    # the dataset (RDB fork COW + client buffers), not the budget.
+    # DECISIONS.md ADR-0012.
+    command: ["redis-server", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
+    mem_limit: 1792m
+    memswap_limit: 1792m
     ports:
       - "6380:6379"
     volumes:

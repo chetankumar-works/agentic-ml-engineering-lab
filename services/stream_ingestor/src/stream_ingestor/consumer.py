@@ -67,14 +67,7 @@ class StreamIngestor:
         # `consumer` is injectable so the loop/probe logic is unit-testable
         # without a broker (tests/test_probes.py).
         self._consumer = consumer or telemetry.instrument_kafka_consumer(
-            Consumer(
-                {
-                    "bootstrap.servers": settings.kafka_bootstrap_servers,
-                    "group.id": settings.consumer_group,
-                    "enable.auto.commit": False,
-                    "auto.offset.reset": "earliest",
-                }
-            )
+            Consumer(settings.consumer_config())
         )
         self._consumer.subscribe(
             [settings.features_topic, settings.labels_topic],
