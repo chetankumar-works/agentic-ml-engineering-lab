@@ -11,17 +11,18 @@ clean stopping point mid-milestone) per the Definition of Done in
 **Milestone 10 has not started**: its memory budget (DECISIONS.md
 ADR-0012, "Projected budget for M10") needs approval first.
 
-**Machine state (2026-09-24):** `scale` mode (`make mode`). The node
-is at 5.5 GiB with 1.5 GiB anon; Airflow is stopped; the ingestor is
-back to 1 replica after the backlog measurements; Redis and
-ingress-nginx are bounded.
+**Machine state (2026-09-24):** `scale` mode (`make mode`) with KEDA
+and metrics-server installed. The node is at 5.5 GiB with 1.5 GiB
+anon; Airflow is stopped; every Deployment is at 1 replica.
 
-**M10 pre-work done (not M10 itself):** scale mode, Redis bound (no
-swap), ingress-nginx bound, a bounded librdkafka prefetch and DB pool
-for the ingestor, and backlog measurements at 1 and 8 replicas
-(ADR-0012). **Open before the inference measurement:** the method for
-inference under load (stale-but-present features; answer pending) and
-Kafka/MLflow swap.
+**M10 pre-work done (not M10 itself):** scale mode (5.5 GiB); swap
+off for Redis, Kafka and MLflow; Redis `maxmemory` 1gb; ingress-nginx
+bounded; bounded ingestor prefetch and pool; inference-api limit 1Gi
+(cold starts measured, 0 limit events); MLflow 1.5 GiB; metrics-server
+and KEDA installed with 256Mi limits and measured; backlog measured at
+1 and 8 replicas (ADR-0012). **Awaiting approval:** the load-generation
+plan (raised `EVENTS_PER_SECOND` step profile; step 0 measures the
+simulator's real ceiling first).
 
 ## Completed work (Milestone 9; earlier milestones in MILESTONE_REPORT.md)
 
@@ -105,6 +106,7 @@ M10 budget: KEDA v2.21.0, metrics-server v0.9.0 (not installed).
 make install · make lint / fmt / typecheck / test (100 tests)
 make mode                                          # current mode or violations — run this first after any Docker restart
 make mode-compose · make mode-k8s · make mode-scale · make mode-kfp  # the only way to switch (ADR-0012)
+make autoscaling-up · make autoscaling-down       # scale mode: metrics-server + KEDA (256Mi each)
 make kfp-up · make kfp-submit · make kfp-down      # kfp mode; kfp-submit needs: kubectl -n kubeflow port-forward svc/ml-pipeline-ui 8888:80
 make pipeline-compile · pipeline-run-steps · pipeline-run-docker
 make k8s-status · make k8s-validate
@@ -115,15 +117,15 @@ scripts/mem_sample.sh /tmp/r.tsv 300 2 0.25 60     # memory sampling (budget fro
 ## Next task
 
 **Milestone 10 — HPA + KEDA scaling experiment.** Acceptance: inference
-can scale and Kafka consumer scaling can be demonstrated. Done so far:
-consumers beyond the partition count get no partitions (8 replicas on 6
-partitions per topic: 2 idle at 79 MiB each). Remaining, in order:
-1. Settle the inference-under-load method and Kafka/MLflow swap.
-2. Install metrics-server and KEDA with explicit limits (a cluster
-   change, so ask first) and measure their anon.
-3. Measure inference-api startup and load peaks, because it already hits
-   its 512Mi limit.
-4. Only then set HPA `maxReplicas` and the KEDA ScaledObject (lag
-   threshold, max 6).
-5. A higher simulator rate for sustained lag: one bounded ingestor
-   drains about 3,800 msg/s.
+can scale and Kafka consumer scaling can be demonstrated. Done:
+consumers beyond the partition count get nothing (8 on 6 partitions: 2
+idle, 79 MiB each). The inference cold-start fix and the autoscaling
+stack are in place. Next, once the load plan is approved:
+1. Step 0: the simulator at a raised `EVENTS_PER_SECOND` for 2 min
+   (achieved rate from Kafka offsets, simulator anon), with no
+   ScaledObject.
+2. KEDA ScaledObject on stream-ingestor (min 1, max 6) and a step
+   profile.
+3. Inference-under-load with the agreed guards (a fixed entity set
+   verified present; the run fails unless every response is a 200 with
+   features; hit rate reported; no-write bias disclosed), then the HPA.

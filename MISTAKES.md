@@ -533,3 +533,26 @@ Format per entry: **What happened** → **Root cause** → **Fix** →
 - **Fix**: `scripts/mem_sample.sh` records `memory.events.local` and
   `memory.peak` per target; the ADR's explanation is revised.
 
+### Sized memory caps from anon alone; inference-api hit its limit on every first cold start
+- **What happened**: inference-api (512Mi limit, 219 MiB anon) had hit
+  its limit 139 times, with 98,710 file refaults. ADR-0012's cap rule
+  ("peak anon ≤ 75%") called it healthy at 43%. MLflow looked the same
+  (57% anon) while its `memory.peak` was at 84% of its cap.
+- **Root cause**: a Python service's working set includes its mapped
+  libraries (numpy, scikit-learn, mlflow: 347 MiB of file pages on a
+  node where they aren't cached). Those are charged to the cgroup that
+  first reads them, and at the limit the kernel evicts the code the
+  process is running.
+- **Fix**: the rule is now anon + hot file (`memory.peak` over the
+  worst phase) ≤ 75%. inference-api is at 1Gi (582 MiB worst cold start,
+  57%, 0 limit events across 5 cold starts); MLflow is at 1.5 GiB.
+
+### Claimed the simulator had bursts without checking the config
+- **What happened**: M10 budget notes said the simulator produced "10×
+  bursts every 30 s". `burst_mode` defaults to false and nothing sets
+  it: the steady rate is 100 rows/s (≈190 msg/s) with no bursts.
+- **Root cause**: I read the burst interval and multiplier fields and
+  assumed they were in use.
+- **Fix**: corrected before any load plan relied on it; the plan in
+  ADR-0012 cites the actual default.
+

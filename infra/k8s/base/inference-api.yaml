@@ -25,7 +25,12 @@ spec:
             - secretRef: { name: amel-secrets }
           resources:
             requests: { cpu: 100m, memory: 256Mi }
-            limits: { cpu: "1", memory: 512Mi }
+            # Cold start = anon 224 MiB + 347 MiB of library page cache on a
+            # node where the libraries are not cached yet (582 MiB total).
+            # 512Mi forced eviction of in-use library pages: 139 limit events,
+            # 98k refaults. 1Gi (57%) is the limit every measured cold start
+            # ran under with zero limit events (DECISIONS.md ADR-0012).
+            limits: { cpu: "1", memory: 1Gi }
           # Start-up: resolving @champion + downloading the model can take
           # a few seconds (longer if MLflow is cold). Liveness = "process
           # can serve or recover"; readiness = model loaded + feast-server

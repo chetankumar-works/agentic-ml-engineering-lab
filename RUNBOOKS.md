@@ -598,3 +598,20 @@ all include page cache, and page cache is not demand.**
   means the working set outgrew 1 GiB. Raise both `maxmemory` and the
   container cap together and re-check ADR-0012's budget. Never remove
   the bound.
+
+## Autoscaling stack (M10): metrics-server + KEDA
+
+- Install only in scale mode: `make mode-scale` (from k8s), then `make
+  autoscaling-up` (pinned versions, 256Mi limit on each Deployment,
+  `--kubelet-insecure-tls` for kind). Remove it with `make
+  autoscaling-down` before `make mode-k8s`, which refuses while the
+  `keda` namespace exists.
+- `kubectl top` percentages are relative to the VM (15.5 GiB), not the
+  node's cgroup cap: the kubelet cannot see the container limit. Never
+  scale on memory utilisation from metrics-server on this cluster.
+- inference-api's memory limit is 1Gi because its first cold start on a
+  node needs 582 MiB (224 anon + 347 of library page cache). Seeing
+  `max` in its pod's `memory.events.local` means a cold start is
+  evicting its own code: raise the limit. Don't tune the startup probe
+  to hide it.
+

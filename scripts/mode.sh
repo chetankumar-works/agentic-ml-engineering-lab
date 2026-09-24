@@ -48,6 +48,12 @@ kfp_installed() {
     || { echo "cannot reach the kind API to check for KFP" >&3; exit 1; }
   [ -n "$ns" ]
 }
+keda_installed() {
+  local ns
+  ns=$(kubectl get namespace keda --ignore-not-found -o name) \
+    || { echo "cannot reach the kind API to check for KEDA" >&3; exit 1; }
+  [ -n "$ns" ]
+}
 wait_api() {
   local deadline=$(( SECONDS + 180 ))
   until kubectl get --raw /readyz >/dev/null 2>&1; do
@@ -88,6 +94,9 @@ check() {
       [ "$(node_cap)" = "$want" ] || { echo "   node cap $(node_cap) bytes, $mode mode needs $want" >&2; bad=1; }
       if [ "$mode" != kfp ] && kfp_installed; then
         echo "   KFP is installed; only kfp mode's cap holds it" >&2; bad=1
+      fi
+      if [ "$mode" = k8s ] && keda_installed; then
+        echo "   KEDA is installed; k8s mode's 3g budget excludes it (make autoscaling-down)" >&2; bad=1
       fi
     fi
   fi
@@ -160,6 +169,9 @@ to_k8s() {
     echo "== no cluster: creating one next to Compose minus the moved services"
     trim_compose k8s
     exec ./scripts/k8s_up.sh
+  fi
+  if node_running && keda_installed; then
+    echo "KEDA is installed; run make autoscaling-down first (k8s mode's 3g budget excludes it)" >&2; exit 1
   fi
   if node_running && [ "$(node_cap)" = "$(bytes "$SCALE_CAP")" ] && ! kfp_installed; then
     echo "== leaving scale mode: manifests back to their replica counts, then the 3g cap"

@@ -878,8 +878,11 @@ cache is listed separately.
 **Rule for capped containers.** A cgroup cap is a backstop, not a
 budget. A capped service needs an internal bound (settings, heap,
 limits in its own config) that keeps it well under the cap, and its
-full PSI must stay ~0. The working margin is **measured peak anon ≤ 75%
-of the cap. This is a safety margin, not a measured boundary.** It
+full PSI must stay ~0. The working margin is **measured peak of anon +
+hot file pages (the cgroup's `memory.peak` over its worst phase, such
+as a cold start) ≤ 75% of the cap. This is a safety margin, not a
+measured boundary.** (First stated as anon only; inference-api
+disproved that. See "inference-api cold start" below.) It
 comes from two data points on one workload: the node livelocked at 82%
 anon (2.47 of 3 GiB, plus a hot file set) and ran clean at 49% (2.92 of
 6 GiB); k8s mode sits at 54–59%. Nothing between 49% and 82% was
@@ -988,16 +991,41 @@ Implications for M10: consumers beyond the partition count cost memory
 sustained overload (a higher simulator rate) to trigger for more than
 a few seconds.
 
-*Still projected (not measured):*
-- KEDA: 3 × 100Mi requests; upstream limits 3 × 1000Mi, to be
-  overridden to 256Mi.
-- metrics-server: 200Mi request; give it a 256Mi limit.
-- inference-api under load. **Its pod has already hit its 512Mi limit
-  139 times** (`memory.peak` 512, anon 219 now; 40 ms of total stall),
-  most likely at startup, when model artifacts in page cache count
-  toward the limit. Every replica the HPA adds will go through that, so
-  measure startup and load peaks before choosing `maxReplicas` or
-  raising the limit.
+*metrics-server and KEDA (installed 2026-09-24 with `make autoscaling-up`,
+scale mode only, 256Mi limit each):* measured idle anon was KEDA
+operator 26 MiB, metrics-apiserver 27, admission 8, and metrics-server
+21 (peaks 15–30 MiB, 5–11% of the limit, 0 limit events). The
+projection from upstream requests (0.49 GiB) overstated them roughly 6×.
+To re-measure: once a ScaledObject polls Kafka. `make mode-k8s`
+refuses while KEDA is installed, because k8s mode's 3g budget excludes
+it.
+
+*inference-api cold start: fixed, then measured.* It had hit its
+512Mi limit 139 times, with 98,710 file refaults: in-use library pages
+were evicted and re-read. The model loads synchronously in the FastAPI
+lifespan, so `/health` doesn't answer until the load is done, and only
+the startup probe (5 s × 24 = 120 s) runs during a load; liveness
+starts after it. Measured at a temporary 1Gi limit, 250 ms sampling:
+
+| cold start | anon | file charged | `memory.peak` | limit events | time to Ready |
+|---|---|---|---|---|---|
+| first on the node (libraries not in page cache) | 224 MiB | 347 MiB | **582 MiB** | 0 | 16 s (imports 5.5 s, model 6.4 s) |
+| 4 concurrent later ones (2 rounds of 1 → 3) | 224 MiB | 1–15 MiB | 236–249 MiB | 0 | 10–11 s, 0 restarts |
+
+Library pages are shared page cache, charged to the cgroup that first
+reads them, so the worst case is the first start on a node. At 512Mi
+that start had to evict its own code. **The limit is now 1Gi**: 582 MiB
+is 57% of it, and every measured cold start, including the worst case,
+ran under exactly that limit with 0 events. Load time of 10–16 s leaves
+the 120 s startup window about 7× margin. The serving pod after the
+change: `memory.peak` 582, 0 events, 0 restarts, smoke-tracing green.
+
+*MLflow on that path:* `memory.peak` reached 863 of its 1 GiB cap
+serving concurrent cold starts (anon 613 plus library pages), 84% by
+the rule above. It's now **1.5 GiB (56%), swap off**. Kafka: **2.5 GiB,
+swap off** (anon 0.94 GiB peak under backlog; the rest leaves room for
+log-segment page cache). Verified: `swap.max 0` and `swap.current 0`
+for Redis, Kafka and MLflow.
 
 *The 28 `max` events from the kfp run, revisited:* cgroup v2
 `memory.events` is **hierarchical**. It counts descendants hitting
@@ -1016,10 +1044,35 @@ records both.
 counts as demand. At swappiness 60, idle pages were swapped out with
 7 GB free: Redis 809 MiB, Airflow 783, MLflow 337, Grafana 214, Kafka
 156, Postgres 25. For MLflow and Kafka the anon-only figures above
-understate demand by those amounts. Redis is fixed; Airflow is
-excluded from scale mode. Kafka (on the latency path of inference's
-publish) and MLflow still swap: disable swap per container or accept it
-as a measured bias. Decide before M10's inference measurements.
+understate demand by those amounts. Resolved: swap is off for Redis,
+Kafka and MLflow (`mem_limit` = `memswap_limit`), and Airflow is
+excluded from scale mode.
+
+**M10 load generation: proposed, not run.** One bounded ingestor
+drains about 3,800 msg/s, and the simulator's steady rate is 100 rows/s
+(≈190 msg/s: a feature now, a label 10 s later). Burst mode is **off**
+by default. So lag never builds and KEDA never triggers. Options:
+- *Burst mode* (5 s at 10× every 35 s): at 100 rows/s a burst is ≈2,000
+  msg/s, below one consumer's capacity. Even raised, a 5 s burst ends
+  before KEDA's polling interval plus the HPA sync can act. Useful only
+  as a negative control: short spikes should *not* scale.
+- *Pre-loaded backlog* (pause, produce, start): a step response from a
+  static backlog. 115k messages drained in ≈33 s with one consumer,
+  faster than KEDA's first poll plus pod start, so it would need ~1M
+  messages to be visible, and scale-in is driven by drain, not by the
+  input rate. It's a good *secondary* test (scale from zero,
+  `minReplicaCount 0`).
+- *Raised `EVENTS_PER_SECOND` as a step profile* (**recommended**):
+  sustained input above one consumer's capacity is the only input that
+  exercises the loop KEDA exists for. Lag grows, replicas rise until
+  aggregate drain exceeds input, lag falls; when the rate drops,
+  replicas come back down after cooldown. It also measures reaction
+  time. Unknowns to measure first (step 0):
+  - The simulator's achievable rate: `sleep(1/rate)` does not subtract
+    per-row work, so actual < configured.
+  - Its label buffer: rate × 10 s of pending labels, against a 256Mi
+    limit.
+
 
 **Future reconsideration trigger.**
 - Re-measure if the training `max_rows` grows past 100k or the task pod

@@ -13,7 +13,8 @@
 # catches spikes between samples, but includes page cache.
 # Targets: vm (MemAvailable in the anon column), node, each amel-* Compose
 # container, and each pod in the `amel` namespace (pod:<name>, when the
-# node is running; the pod list is refreshed every 5 s).
+# node is running; pod cgroups are found every sweep, names every 5 s —
+# a pod newer than the last refresh is sampled as pod:uid-<first 8>).
 # Use anon (+shmem) for budgets: `docker stats` and `current` include page cache.
 set -euo pipefail
 OUT=$1 DURATION=$2 INTERVAL=${3:-2} FAST=${4:-} FAST_FOR=${5:-0}
@@ -21,13 +22,24 @@ NODE=amel-control-plane
 declare -A CG
 
 cg_of() { local id; id=$(docker inspect -f '{{.Id}}' "$1" 2>/dev/null) && echo "/sys/fs/cgroup/docker/$id"; }
-refresh_pods() {
-  local base=$1 uid ns name dir
-  for k in "${!CG[@]}"; do [[ $k == pod:* ]] && unset "CG[$k]"; done
-  while read -r uid name; do
-    dir=$(find "$base/kubelet.slice" -maxdepth 3 -type d -name "*pod${uid//-/_}.slice" 2>/dev/null | head -1)
-    [ -n "$dir" ] && CG["pod:$name"]=$dir
-  done < <(kubectl -n amel get pods -o custom-columns=U:.metadata.uid,N:.metadata.name --no-headers 2>/dev/null || true)
+declare -A PODNAME
+# Pod cgroups are globbed on every sweep (a new pod is sampled from its
+# first moment — cold starts matter); kubectl only maps uid -> name, every 5 s.
+refresh_names() {
+  local uid name
+  PODNAME=()
+  while read -r uid name; do PODNAME[${uid//-/_}]=$name; done \
+    < <(kubectl -n amel get pods -o custom-columns=U:.metadata.uid,N:.metadata.name --no-headers 2>/dev/null || true)
+}
+pod_dirs() {
+  local base=$1 d u
+  for d in "$base"/kubelet.slice/kubelet-kubepods.slice/*pod*.slice \
+           "$base"/kubelet.slice/kubelet-kubepods.slice/*/*pod*.slice; do
+    [ -d "$d" ] || continue
+    u=${d##*pod}; u=${u%.slice}
+    # not yet named (created since the last refresh): sample it by uid
+    printf '%s\t%s\n' "pod:${PODNAME[$u]:-uid-${u:0:8}}" "$d"
+  done
 }
 sample() {  # target dir
   local d=$2 a s f cur peak full maxev
@@ -45,12 +57,15 @@ printf 'epoch_ms\ttarget\tanon_mib\tshmem_mib\tfile_mib\tcurrent_mib\tpeak_mib\t
 start=$SECONDS last_refresh=-5
 while [ $(( SECONDS - start )) -lt "$DURATION" ]; do
   if [ -n "${CG[$NODE]:-}" ] && [ $(( SECONDS - last_refresh )) -ge 5 ]; then
-    refresh_pods "${CG[$NODE]}"; last_refresh=$SECONDS
+    refresh_names; last_refresh=$SECONDS
   fi
   t0=${EPOCHREALTIME/./}; now=$(( t0 / 1000 ))   # µs -> ms; `date +%3N` is not portable here
   {
     printf '%s\tvm\t%s\t-\t-\t-\t-\t-\t-\n' "$now" "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"
     for t in "${!CG[@]}"; do sample "$t" "${CG[$t]}"; done
+    if [ -n "${CG[$NODE]:-}" ]; then
+      while IFS=$'\t' read -r t d; do sample "$t" "$d"; done < <(pod_dirs "${CG[$NODE]}")
+    fi
   } >> "$OUT"
   # sleep only what is left of the interval (a sweep itself takes ~90 ms)
   step=$INTERVAL; [ -n "$FAST" ] && [ $(( SECONDS - start )) -lt "$FAST_FOR" ] && step=$FAST

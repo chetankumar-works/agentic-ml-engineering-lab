@@ -51,6 +51,13 @@ services:
   kafka:
     restart: unless-stopped
     image: apache/kafka:3.9.0
+    # Bounded inside by the JVM heap (-Xmx1G; anon peaked at 0.94 GiB under
+    # backlog). mem_limit == memswap_limit disables swap: Kafka is on the
+    # inference publish path and swappiness 60 had pushed 156 MiB of it out
+    # with 7 GB free. 2.5 GiB leaves room for log-segment page cache so
+    # backlog reads don't evict their own hot pages (DECISIONS.md ADR-0012).
+    mem_limit: 2560m
+    memswap_limit: 2560m
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -354,7 +361,12 @@ services:
       AWS_REGION: us-east-1
     ports:
       - "5000:5000"
-    mem_limit: 1g
+    # No swap: every replica the autoscaler adds cold-starts and pulls the
+    # model through MLflow; a swapped MLflow slows exactly that path.
+    # memory.peak reached 863 MiB of a 1g cap serving concurrent cold starts
+    # (anon 613 + hot library pages); 1.5g keeps that at 56%.
+    mem_limit: 1536m
+    memswap_limit: 1536m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
       interval: 10s
