@@ -1013,7 +1013,14 @@ starts after it. Measured at a temporary 1Gi limit, 250 ms sampling:
 | 4 concurrent later ones (2 rounds of 1 → 3) | 224 MiB | 1–15 MiB | 236–249 MiB | 0 | 10–11 s, 0 restarts |
 
 Library pages are shared page cache, charged to the cgroup that first
-reads them, so the worst case is the first start on a node. At 512Mi
+reads them, so the worst case is the first start on a node.
+**Consequence: "each replica costs ~249 MiB" is an artifact of this
+single-node cluster, not a portable number.** Here only the first pod
+pays the 347 MiB of libraries and later replicas look cheap. On a
+multi-node cluster the first pod on *each* node pays it. The per-replica
+figure errs in exactly the direction that under-provisions a real
+cluster. Size a real cluster's limits and per-node headroom from the
+582 MiB cold start, never from the warm 236–249 MiB. At 512Mi
 that start had to evict its own code. **The limit is now 1Gi**: 582 MiB
 is 57% of it, and every measured cold start, including the worst case,
 ran under exactly that limit with 0 events. Load time of 10–16 s leaves
@@ -1072,6 +1079,44 @@ by default. So lag never builds and KEDA never triggers. Options:
     per-row work, so actual < configured.
   - Its label buffer: rate × 10 s of pending labels, against a 256Mi
     limit.
+
+  Approved 2026-09-24, with three additions:
+  - **ScaledObject max 8 for at least one run** (6 partitions + 2). The
+    autoscaler itself then shows that replicas beyond the partition
+    count add nothing (2 idle pods ≈ 158 MiB). Capture the lag drain
+    rate at 6 vs 8 replicas: the curve should flatten.
+  - **Scale-down measured as deliberately as scale-up:** KEDA
+    `cooldownPeriod` and the HPA `scaleDown.stabilizationWindowSeconds`
+    as configured, the time from the input-rate drop to the first
+    replica removed, and whether replica counts flap. Oscillation on
+    the way down is the classic autoscaling failure, and watching only
+    the ramp would miss it.
+  - Step 0 reports the achieved rate and the simulator's label-buffer
+    headroom before the step profile is designed.
+
+  **Step 0, measured 2026-09-24:** `EVENTS_PER_SECOND=20000` for 127 s,
+  one ingestor, no ScaledObject. `HIGGS_START_INDEX` was moved past
+  every landed or produced ID before each restart, so no replayed IDs
+  went down the ingestor's cheaper dedup path.
+  - **Achieved: 3,432 rows/s = 6,854 msg/s** (features + labels). The
+    limit is the single-threaded loop at 0.88 cores; the 1-core CPU limit
+    throttled only 0.7% of periods.
+  - **Label buffer:** ≈34k pending (rate × 10 s). Simulator anon was
+    **92 MiB flat** (53 at 100/s), ≈1.2 KB per pending label, 36% of
+    256Mi. Its `memory.peak` was 217 MiB (85%), mostly page cache from
+    streaming the HIGGS zip at 34× the normal rate: cold pages read once,
+    0 limit events.
+  - **One consumer under live flow: ≈5,700 msg/s** (lag grew ≈1,150
+    msg/s). The step-0 backlog then drained at ≈4,800 msg/s. The
+    earlier "3,800/s" came from backlog drains that included pod start
+    and group join.
+  - Kafka `memory.peak` 1,996 of 2,560 MiB (anon 1,089, 43%; the rest
+    write-behind page cache at ≈10 MB/s). Node anon peak 1.53 GiB, PSI 0;
+    VM ≥ 8.6 GB available.
+  - **Consequence:** one simulator is only ≈1.2× one consumer, so
+    sustained input alone would take KEDA from 1 to 2 replicas. That's
+    enough to exercise the control loop and scale-down, but it can't
+    reach 6 or 8. The profile design goes back for review.
 
 
 **Future reconsideration trigger.**
